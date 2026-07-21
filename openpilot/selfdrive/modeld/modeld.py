@@ -313,7 +313,22 @@ def main(demo=False):
     }
 
     mt1 = time.perf_counter()
-    model_output = model.run(bufs, transforms, inputs)
+    try:
+      model_output = model.run(bufs, transforms, inputs)
+    except Exception as e:
+      if not USBGPU:
+        raise
+
+      params.put_bool("UsbGpuReady", False)
+      params.put("UsbGpuInitError", f"{type(e).__name__}: {e}")
+      cloudlog.exception("USB GPU model execution failed, falling back to QCOM")
+      USBGPU = False
+      lat_delay = model.lat_delay
+      model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
+      model.lat_delay = lat_delay
+      bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
+      transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
+      model_output = model.run(bufs, transforms, inputs)
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
