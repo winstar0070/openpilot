@@ -48,7 +48,8 @@ function usbgpu_speed {
 function prepare_usbgpu {
   local usbgpu_xhci_device="xhci-hcd.1.auto"
   local usbgpu_xhci_path="/sys/bus/platform/devices/$usbgpu_xhci_device"
-  local usbgpu_xhci_driver usbgpu_current_speed usbgpu_stable_seconds=0
+  local usbgpu_xhci_driver usbgpu_current_speed
+  local usbgpu_attempt usbgpu_stable_seconds usbgpu_slow_seconds
 
   [ -L "$usbgpu_xhci_path/driver" ] || return
   usbgpu_current_speed="$(usbgpu_speed)"
@@ -57,33 +58,49 @@ function prepare_usbgpu {
 
   usbgpu_xhci_driver="$(readlink -f "$usbgpu_xhci_path/driver")"
   [ -d "$usbgpu_xhci_driver" ] || return
-  echo "USB GPU detected at ${usbgpu_current_speed}M; resetting $usbgpu_xhci_device"
+  echo "USB GPU detected at ${usbgpu_current_speed}M"
 
-  if ! echo "$usbgpu_xhci_device" | sudo tee "$usbgpu_xhci_driver/unbind" > /dev/null; then
-    echo "Failed to unbind $usbgpu_xhci_device"
-    return
-  fi
-  sleep 3
-  if ! echo "$usbgpu_xhci_device" | sudo tee "$usbgpu_xhci_driver/bind" > /dev/null; then
-    echo "Failed to bind $usbgpu_xhci_device"
-    return
-  fi
+  for usbgpu_attempt in {1..3}; do
+    usbgpu_stable_seconds=0
+    usbgpu_slow_seconds=0
+    echo "Resetting $usbgpu_xhci_device (attempt $usbgpu_attempt/3)"
 
-  # Require eight continuous seconds at SuperSpeed. The observed PD hard reset
-  # happens several seconds after enumeration, so an immediate 5000M result is
-  # not enough to consider the link ready.
-  for _ in {1..30}; do
-    usbgpu_current_speed="$(usbgpu_speed)"
-    if [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
-      usbgpu_stable_seconds=$((usbgpu_stable_seconds + 1))
-      if [ "$usbgpu_stable_seconds" -ge 8 ]; then
-        echo "USB GPU ready at ${usbgpu_current_speed}M"
-        return
-      fi
-    else
-      usbgpu_stable_seconds=0
+    if ! echo "$usbgpu_xhci_device" | sudo tee "$usbgpu_xhci_driver/unbind" > /dev/null; then
+      echo "Failed to unbind $usbgpu_xhci_device"
+      return
     fi
-    sleep 1
+    sleep 3
+    if ! echo "$usbgpu_xhci_device" | sudo tee "$usbgpu_xhci_driver/bind" > /dev/null; then
+      echo "Failed to bind $usbgpu_xhci_device"
+      return
+    fi
+
+    # Require eight continuous seconds at SuperSpeed. A stable low-speed
+    # enumeration cannot upgrade in place, so retry it without waiting longer.
+    for _ in {1..30}; do
+      usbgpu_current_speed="$(usbgpu_speed)"
+      if [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
+        usbgpu_stable_seconds=$((usbgpu_stable_seconds + 1))
+        usbgpu_slow_seconds=0
+        if [ "$usbgpu_stable_seconds" -ge 8 ]; then
+          echo "USB GPU ready at ${usbgpu_current_speed}M"
+          return
+        fi
+      elif [ "$usbgpu_current_speed" -gt 0 ] 2>/dev/null; then
+        usbgpu_stable_seconds=0
+        usbgpu_slow_seconds=$((usbgpu_slow_seconds + 1))
+        [ "$usbgpu_slow_seconds" -ge 5 ] && break
+      else
+        usbgpu_stable_seconds=0
+        usbgpu_slow_seconds=0
+      fi
+      sleep 1
+    done
+
+    if [ "$usbgpu_attempt" -lt 3 ]; then
+      echo "USB GPU remained at ${usbgpu_current_speed}M; retrying in 5 seconds"
+      sleep 5
+    fi
   done
   echo "USB GPU did not remain at SuperSpeed; modeld will fall back to QCOM"
 }
