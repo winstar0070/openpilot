@@ -183,11 +183,14 @@ def main(demo=False):
   try:
     model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
   except Exception as e:
-    if USBGPU:
-      params.put_bool("UsbGpuReady", False)
-      params.put("UsbGpuInitError", f"{type(e).__name__}: {e}")
-      cloudlog.exception("USB GPU model initialization failed")
-    raise
+    if not USBGPU:
+      raise
+
+    params.put_bool("UsbGpuReady", False)
+    params.put("UsbGpuInitError", f"{type(e).__name__}: {e}")
+    cloudlog.exception("USB GPU model initialization failed, falling back to QCOM")
+    USBGPU = False
+    model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
   if USBGPU:
     ready = wait_for_usbgpu_ready(2.0)
     params.put_bool("UsbGpuReady", ready)
