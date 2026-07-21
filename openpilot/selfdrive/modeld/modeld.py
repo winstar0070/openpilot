@@ -34,7 +34,8 @@ from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
-USBGPU_ATTACH_TIMEOUT = 2.0
+USBGPU_ATTACH_TIMEOUT = float(os.getenv("USBGPU_ATTACH_TIMEOUT_SEC", "30"))
+USBGPU_READY_TIMEOUT = float(os.getenv("USBGPU_READY_TIMEOUT_SEC", "5"))
 
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
@@ -164,7 +165,13 @@ def main(demo=False):
   cloudlog.warning("modeld init")
 
   _compiled = os.path.isfile(get_manifest_path(modeld_pkl_path(usbgpu=True)))
-  _present = usbgpu_present() or (_compiled and wait_for_usbgpu_present(USBGPU_ATTACH_TIMEOUT))
+  detection_started = time.monotonic()
+  _present = usbgpu_present()
+  if _compiled and not _present:
+    cloudlog.warning(f"USB GPU model compiled; waiting up to {USBGPU_ATTACH_TIMEOUT:.1f}s for ignition-time attachment")
+    _present = wait_for_usbgpu_present(USBGPU_ATTACH_TIMEOUT)
+  detection_time = time.monotonic() - detection_started
+  _speed = usbgpu_speed() if _present else None
   USBGPU = _present and _compiled
   params = Params()
   params.put_bool("UsbGpuPresent", _present)
@@ -172,7 +179,12 @@ def main(demo=False):
   params.put_bool("UsbGpuReady", usbgpu_superspeed_ready())
   params.remove("UsbGpuInitError")
   if USBGPU:
-    cloudlog.warning(f"USB GPU detected at {usbgpu_speed()}M; initializing {'SuperSpeed' if usbgpu_superspeed_ready() else 'bootstrap'} device")
+    device_kind = 'SuperSpeed' if usbgpu_superspeed_ready() else 'bootstrap'
+    cloudlog.warning(f"USB GPU detected after {detection_time:.1f}s at {_speed}M; initializing {device_kind} device")
+  elif _compiled:
+    error = f"USB GPU not detected within {USBGPU_ATTACH_TIMEOUT:.1f}s; falling back to QCOM"
+    params.put("UsbGpuInitError", error)
+    cloudlog.error(error)
 
   config_realtime_process(7, 54)
 
@@ -214,7 +226,7 @@ def main(demo=False):
     USBGPU = False
     model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
   if USBGPU:
-    ready = wait_for_usbgpu_ready(2.0)
+    ready = wait_for_usbgpu_ready(USBGPU_READY_TIMEOUT)
     params.put_bool("UsbGpuReady", ready)
     if ready:
       params.remove("UsbGpuInitError")

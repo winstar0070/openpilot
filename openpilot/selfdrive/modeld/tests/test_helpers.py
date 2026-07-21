@@ -43,5 +43,30 @@ def test_absent():
 def test_waits_for_delayed_presence(monkeypatch):
   with tempfile.TemporaryDirectory() as tempdir:
     sysfs_root = Path(tempdir)
-    monkeypatch.setattr(helpers.time, "sleep", lambda _: add_usb_device(sysfs_root, "4-1", 5000))
-    assert wait_for_usbgpu_present(1, sysfs_root=sysfs_root)
+    elapsed = 0.0
+
+    def sleep(interval: float):
+      nonlocal elapsed
+      elapsed += interval
+      if elapsed >= 3.0 and not usbgpu_present(sysfs_root):
+        add_usb_device(sysfs_root, "4-1", 5000)
+
+    monkeypatch.setattr(helpers.time, "sleep", sleep)
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: elapsed)
+    assert wait_for_usbgpu_present(30, poll_interval=1, sysfs_root=sysfs_root)
+    assert elapsed == 3.0
+
+
+def test_wait_for_presence_times_out(monkeypatch):
+  with tempfile.TemporaryDirectory() as tempdir:
+    sysfs_root = Path(tempdir)
+    elapsed = 0.0
+
+    def sleep(interval: float):
+      nonlocal elapsed
+      elapsed += interval
+
+    monkeypatch.setattr(helpers.time, "sleep", sleep)
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: elapsed)
+    assert not wait_for_usbgpu_present(3, poll_interval=1, sysfs_root=sysfs_root)
+    assert elapsed == 3.0
