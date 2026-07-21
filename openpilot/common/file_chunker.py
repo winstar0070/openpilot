@@ -42,7 +42,7 @@ def get_existing_chunks(path):
 class ChunkStream(io.RawIOBase):
   def __init__(self, paths):
     self._paths = iter(paths)
-    self._buf = memoryview(b'')
+    self._file = None
 
   def readable(self):
     return True
@@ -50,18 +50,25 @@ class ChunkStream(io.RawIOBase):
   def readinto(self, b):
     n = 0
     while n < len(b):
-      if not self._buf:
+      if self._file is None:
         p = next(self._paths, None)
         if p is None:
           break
-        with open(p, 'rb') as f:
-          self._buf = memoryview(f.read())
-        continue
-      take = min(len(b) - n, len(self._buf))
-      b[n:n + take] = self._buf[:take]
-      self._buf = self._buf[take:]
-      n += take
+        self._file = open(p, 'rb')
+
+      read = self._file.readinto(memoryview(b)[n:])
+      if read:
+        n += read
+      else:
+        self._file.close()
+        self._file = None
     return n
+
+  def close(self):
+    if self._file is not None:
+      self._file.close()
+      self._file = None
+    super().close()
 
 def open_file_chunked(path):
   manifest_path = get_manifest_path(path)
