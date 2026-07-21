@@ -376,7 +376,14 @@ def main() -> None:
   p.add_argument('--output', required=True)
   p.add_argument('--frame-skip', type=int, required=True)
   p.add_argument('--failure-marker', help='write USB GPU session-loss reason to this path')
+  p.add_argument('--compile-workers', type=int,
+                 default=int(os.getenv('PARALLEL_COMPILE', min(2, os.cpu_count() or 1))),
+                 help='parallel CPU kernel compilation workers (0 or 1 disables)')
   args = p.parse_args()
+
+  if args.compile_workers < 0:
+    p.error('--compile-workers must be non-negative')
+  os.environ['PARALLEL_COMPILE'] = str(args.compile_workers)
 
   if args.failure_marker:
     try:
