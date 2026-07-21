@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 os.environ['GMMU'] = '0' # for usbgpu fast loading, noop for qcom
 from tinygrad.tensor import Tensor
@@ -24,6 +25,7 @@ from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, WARP_IN
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.common.file_chunker import open_file_chunked, get_manifest_path
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
+from openpilot.selfdrive.modeld.egpu_diagnostics import collect_egpu_diagnostics
 from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_speed, usbgpu_superspeed_ready, wait_for_usbgpu_ready
 from openpilot.selfdrive.modeld.helpers import modeld_pkl_path, get_tg_input_devices, load_oob
 
@@ -319,8 +321,22 @@ def main(demo=False):
       if not USBGPU:
         raise
 
+      diagnostic_path = None
+      try:
+        diagnostic_path, diagnostics = collect_egpu_diagnostics(e)
+        diagnostic_summary = {
+          "path": str(diagnostic_path) if diagnostic_path is not None else None,
+          "egpuDevices": diagnostics.get("egpuDevices", []),
+          "xhci": diagnostics.get("xhci", {}),
+          "systemPower": diagnostics.get("systemPower", {}),
+          "kernelLogError": diagnostics.get("kernelLog", {}).get("error"),
+          "saveError": diagnostics.get("saveError"),
+        }
+        cloudlog.error(f"USB GPU diagnostics: {json.dumps(diagnostic_summary, separators=(',', ':'))}")
+      except Exception:
+        cloudlog.exception("USB GPU diagnostic collection failed")
       params.put_bool("UsbGpuReady", False)
-      params.put("UsbGpuInitError", f"{type(e).__name__}: {e}")
+      params.put("UsbGpuInitError", f"{type(e).__name__}: {e}; diagnostics={diagnostic_path}")
       cloudlog.exception("USB GPU model execution failed, falling back to QCOM")
       USBGPU = False
       lat_delay = model.lat_delay
