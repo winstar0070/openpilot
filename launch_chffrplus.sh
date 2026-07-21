@@ -28,6 +28,66 @@ function agnos_init {
   fi
 }
 
+function usbgpu_speed {
+  local usbgpu_device usbgpu_speed_candidate usbgpu_speed_value=0
+  for usbgpu_device in /sys/bus/usb/devices/*; do
+    [ -f "$usbgpu_device/idVendor" ] || continue
+    [ -f "$usbgpu_device/idProduct" ] || continue
+    [ "$(< "$usbgpu_device/idVendor")" = "add1" ] || continue
+    [ "$(< "$usbgpu_device/idProduct")" = "0001" ] || continue
+    [ -f "$usbgpu_device/speed" ] || continue
+    usbgpu_speed_candidate="$(< "$usbgpu_device/speed")"
+    usbgpu_speed_candidate="${usbgpu_speed_candidate%%.*}"
+    if [ "$usbgpu_speed_candidate" -gt "$usbgpu_speed_value" ] 2>/dev/null; then
+      usbgpu_speed_value="$usbgpu_speed_candidate"
+    fi
+  done
+  echo "$usbgpu_speed_value"
+}
+
+function prepare_usbgpu {
+  local usbgpu_xhci_device="xhci-hcd.1.auto"
+  local usbgpu_xhci_path="/sys/bus/platform/devices/$usbgpu_xhci_device"
+  local usbgpu_xhci_driver usbgpu_current_speed usbgpu_stable_seconds=0
+
+  [ -L "$usbgpu_xhci_path/driver" ] || return
+  usbgpu_current_speed="$(usbgpu_speed)"
+  [ "$usbgpu_current_speed" -gt 0 ] 2>/dev/null || return
+  [ "$usbgpu_current_speed" -lt 5000 ] 2>/dev/null || return
+
+  usbgpu_xhci_driver="$(readlink -f "$usbgpu_xhci_path/driver")"
+  [ -d "$usbgpu_xhci_driver" ] || return
+  echo "USB GPU detected at ${usbgpu_current_speed}M; resetting $usbgpu_xhci_device"
+
+  if ! echo "$usbgpu_xhci_device" | sudo tee "$usbgpu_xhci_driver/unbind" > /dev/null; then
+    echo "Failed to unbind $usbgpu_xhci_device"
+    return
+  fi
+  sleep 3
+  if ! echo "$usbgpu_xhci_device" | sudo tee "$usbgpu_xhci_driver/bind" > /dev/null; then
+    echo "Failed to bind $usbgpu_xhci_device"
+    return
+  fi
+
+  # Require eight continuous seconds at SuperSpeed. The observed PD hard reset
+  # happens several seconds after enumeration, so an immediate 5000M result is
+  # not enough to consider the link ready.
+  for _ in {1..30}; do
+    usbgpu_current_speed="$(usbgpu_speed)"
+    if [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
+      usbgpu_stable_seconds=$((usbgpu_stable_seconds + 1))
+      if [ "$usbgpu_stable_seconds" -ge 8 ]; then
+        echo "USB GPU ready at ${usbgpu_current_speed}M"
+        return
+      fi
+    else
+      usbgpu_stable_seconds=0
+    fi
+    sleep 1
+  done
+  echo "USB GPU did not remain at SuperSpeed; modeld will fall back to QCOM"
+}
+
 function launch {
   # Remove orphaned git lock if it exists on boot
   [ -f "$DIR/.git/index.lock" ] && rm -f $DIR/.git/index.lock
@@ -81,6 +141,7 @@ function launch {
   # hardware specific init
   if [ -f /AGNOS ]; then
     agnos_init
+    prepare_usbgpu
   fi
 
   # write tmux scrollback to a file
