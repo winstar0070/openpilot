@@ -35,7 +35,8 @@ from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 USBGPU_ATTACH_TIMEOUT = float(os.getenv("USBGPU_ATTACH_TIMEOUT_SEC", "30"))
-USBGPU_READY_TIMEOUT = float(os.getenv("USBGPU_READY_TIMEOUT_SEC", "5"))
+USBGPU_READY_TIMEOUT = float(os.getenv("USBGPU_READY_TIMEOUT_SEC", "15"))
+USBGPU_STABLE_DURATION = float(os.getenv("USBGPU_STABLE_DURATION_SEC", "8"))
 
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
@@ -176,7 +177,8 @@ def main(demo=False):
   params = Params()
   params.put_bool("UsbGpuPresent", _present)
   params.put_bool("UsbGpuCompiled", _compiled)
-  params.put_bool("UsbGpuReady", usbgpu_superspeed_ready())
+  # Ready means model initialization succeeded and the configured SuperSpeed link stayed stable.
+  params.put_bool("UsbGpuReady", False)
   params.remove("UsbGpuInitError")
   if USBGPU:
     device_kind = 'SuperSpeed' if usbgpu_superspeed_ready() else 'bootstrap'
@@ -226,13 +228,13 @@ def main(demo=False):
     USBGPU = False
     model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
   if USBGPU:
-    ready = wait_for_usbgpu_ready(USBGPU_READY_TIMEOUT)
+    ready = wait_for_usbgpu_ready(USBGPU_READY_TIMEOUT, stable_duration=USBGPU_STABLE_DURATION)
     params.put_bool("UsbGpuReady", ready)
     if ready:
       params.remove("UsbGpuInitError")
     else:
-      params.put("UsbGpuInitError", "AMD probe succeeded but USB device did not report SuperSpeed")
-      cloudlog.error("USB GPU probe succeeded without SuperSpeed readiness")
+      params.put("UsbGpuInitError", "AMD probe succeeded but USB device did not remain configured at SuperSpeed")
+      cloudlog.error("USB GPU probe succeeded without stable configured SuperSpeed readiness")
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging

@@ -83,12 +83,29 @@ def usbgpu_speed(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> int | None:
   return max(speeds, default=None)
 
 def usbgpu_superspeed_ready(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
-  return (speed := usbgpu_speed(sysfs_root)) is not None and speed >= USBGPU_SUPERSPEED_MBIT
+  for d in _usbgpu_devices(sysfs_root):
+    try:
+      speed = int(float((d / "speed").read_text().strip()))
+      configuration = int((d / "bConfigurationValue").read_text().strip())
+      if speed >= USBGPU_SUPERSPEED_MBIT and configuration > 0:
+        return True
+    except (OSError, ValueError):
+      pass
+  return False
 
-def wait_for_usbgpu_ready(timeout: float, poll_interval: float = 0.1, sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
+def wait_for_usbgpu_ready(timeout: float, stable_duration: float = 0.0, poll_interval: float = 0.1,
+                          sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
   deadline = time.monotonic() + timeout
-  while not usbgpu_superspeed_ready(sysfs_root):
+  stable_since = None
+  while True:
+    now = time.monotonic()
+    if usbgpu_superspeed_ready(sysfs_root):
+      if stable_since is None:
+        stable_since = now
+      if now - stable_since >= stable_duration:
+        return True
+    else:
+      stable_since = None
     if time.monotonic() >= deadline:
       return False
     time.sleep(poll_interval)
-  return True
