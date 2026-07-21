@@ -104,6 +104,14 @@ function prepare_usbgpu {
   [ -d "$usbgpu_xhci_driver" ] || return
   echo "USB GPU detected at ${usbgpu_current_speed}M"
 
+  # The custom ASM2464PD firmware intentionally enumerates at low speed first.
+  # tinygrad sends F3 to power PCIe and owns the resulting SuperSpeed
+  # re-enumeration. Resetting xHCI here races that firmware state machine.
+  if [ "$usbgpu_current_speed" -lt 5000 ] 2>/dev/null; then
+    echo "USB GPU bootstrap device detected; handing off to tinygrad"
+    return
+  fi
+
   if [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
     if wait_for_usbgpu_stable "$USBGPU_INITIAL_STABILITY_TIMEOUT_SEC" 0; then
       echo "USB GPU ready at ${usbgpu_current_speed}M"
@@ -125,8 +133,7 @@ function prepare_usbgpu {
       return
     fi
 
-    # Require eight continuous seconds at SuperSpeed. A stable low-speed
-    # enumeration cannot upgrade in place, so retry it without waiting longer.
+    # Require eight continuous seconds at SuperSpeed after controller recovery.
     if wait_for_usbgpu_stable "$USBGPU_RECOVERY_TIMEOUT_SEC" 1; then
       usbgpu_current_speed="$(usbgpu_speed)"
       echo "USB GPU ready at ${usbgpu_current_speed}M"
