@@ -4,12 +4,15 @@ import pickle
 import shutil
 import struct
 import tempfile
+import time
 from pathlib import Path
 
 MODELS_DIR = Path(__file__).resolve().parent / 'models'
 TG_INPUT_DEVICES_PATH = MODELS_DIR / 'tg_input_devices.json'
 USBGPU_VID = 0xADD1
 USBGPU_PID = 0x0001
+USBGPU_SYSFS_ROOT = Path("/sys/bus/usb/devices")
+USBGPU_SUPERSPEED_MBIT = 5000
 
 
 def get_tg_input_devices(process_name: str, usbgpu: bool):
@@ -48,12 +51,36 @@ def load_oob(f):
       yield prev
   return pickle.load(io.BytesIO(opcodes), buffers=buffers())
 
-def usbgpu_present() -> bool:
-  for d in Path("/sys/bus/usb/devices").glob("*"):
+def _usbgpu_devices(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> list[Path]:
+  devices = []
+  for d in sysfs_root.glob("*"):
     try:
       if int((d / "idVendor").read_text(), 16) == USBGPU_VID and \
           int((d / "idProduct").read_text(), 16) == USBGPU_PID:
-        return True
-    except Exception:
+        devices.append(d)
+    except (OSError, ValueError):
       pass
-  return False
+  return devices
+
+def usbgpu_present(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
+  return bool(_usbgpu_devices(sysfs_root))
+
+def usbgpu_speed(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> int | None:
+  speeds = []
+  for d in _usbgpu_devices(sysfs_root):
+    try:
+      speeds.append(int(float((d / "speed").read_text().strip())))
+    except (OSError, ValueError):
+      pass
+  return max(speeds, default=None)
+
+def usbgpu_superspeed_ready(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
+  return (speed := usbgpu_speed(sysfs_root)) is not None and speed >= USBGPU_SUPERSPEED_MBIT
+
+def wait_for_usbgpu_ready(timeout: float, poll_interval: float = 0.1, sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
+  deadline = time.monotonic() + timeout
+  while not usbgpu_superspeed_ready(sysfs_root):
+    if time.monotonic() >= deadline:
+      return False
+    time.sleep(poll_interval)
+  return True

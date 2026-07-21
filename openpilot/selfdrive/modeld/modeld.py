@@ -24,7 +24,8 @@ from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, WARP_IN
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.common.file_chunker import open_file_chunked, get_manifest_path
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.helpers import usbgpu_present, modeld_pkl_path, get_tg_input_devices, load_oob
+from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_speed, usbgpu_superspeed_ready, wait_for_usbgpu_ready
+from openpilot.selfdrive.modeld.helpers import modeld_pkl_path, get_tg_input_devices, load_oob
 
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
@@ -147,6 +148,10 @@ def main(demo=False):
   params = Params()
   params.put_bool("UsbGpuPresent", _present)
   params.put_bool("UsbGpuCompiled", _compiled)
+  params.put_bool("UsbGpuReady", usbgpu_superspeed_ready())
+  params.remove("UsbGpuInitError")
+  if USBGPU:
+    cloudlog.warning(f"USB GPU detected at {usbgpu_speed()}M; initializing {'SuperSpeed' if usbgpu_superspeed_ready() else 'bootstrap'} device")
 
   config_realtime_process(7, 54)
 
@@ -175,7 +180,22 @@ def main(demo=False):
 
   st = time.monotonic()
   cloudlog.warning("loading model")
-  model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
+  try:
+    model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
+  except Exception as e:
+    if USBGPU:
+      params.put_bool("UsbGpuReady", False)
+      params.put("UsbGpuInitError", f"{type(e).__name__}: {e}")
+      cloudlog.exception("USB GPU model initialization failed")
+    raise
+  if USBGPU:
+    ready = wait_for_usbgpu_ready(2.0)
+    params.put_bool("UsbGpuReady", ready)
+    if ready:
+      params.remove("UsbGpuInitError")
+    else:
+      params.put("UsbGpuInitError", "AMD probe succeeded but USB device did not report SuperSpeed")
+      cloudlog.error("USB GPU probe succeeded without SuperSpeed readiness")
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging
