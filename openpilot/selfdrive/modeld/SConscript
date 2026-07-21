@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+import shlex
 import sys, subprocess
 from SCons.Script import Action, Value
 from openpilot.common.file_chunker import chunk_file, get_chunk_targets, get_existing_chunks
@@ -57,9 +58,10 @@ tg_devices = { # which device to put jit inputs to at runtime
 USBGPU = usbgpu_present() # or release # TODO always build big model on release
 if USBGPU:
   usbgpu_tg_flags = f'DEBUG=2 DEV=USB+AMD:LLVM WARP_DEV={tg_backend} FLOAT16=1 JIT_BATCH_SIZE=0 GMMU=0 ' \
-                    'USB_REENUM_TIMEOUT_MS=120000 HCQDEV_WAIT_TIMEOUT_MS=120000'
+                    'USB_REENUM_TIMEOUT_MS=120000 HCQDEV_WAIT_TIMEOUT_MS=10000'
   # the USB+AMD GPU takes an exclusive flock; serialize all targets that touch it
   usbgpu_lock = File("models/.usb_gpu.lock").abspath
+  usbgpu_failure_marker = os.getenv("USBGPU_BUILD_FAILURE_MARKER", "/tmp/openpilot_usbgpu_build_failure")
 
 def write_tg_devices(target, source, env):
   with open(str(target[0]), "w") as f:
@@ -91,15 +93,42 @@ for usbgpu in [False, True] if USBGPU else [False]:
   file_prefix, cmd_flags = ('big_', usbgpu_tg_flags) if usbgpu else ('big_' if os.getenv('BIG_INTO_SMALL') else '', tg_flags)
   driving_onnx_deps = get_existing_chunks(File(f"models/{file_prefix}driving_supercombo.onnx").abspath)
   camera_res_args = ' '.join(f'{cw}x{ch}' for cw, ch in CAMERA_CONFIGS)
+  failure_marker_arg = f' --failure-marker {shlex.quote(usbgpu_failure_marker)}' if usbgpu else ''
   cmd = (f'{cmd_flags} {mac_brew_string} python3 {modeld_dir}/compile_modeld.py '
-        f'--model-size {model_w}x{model_h} '
-        f'--camera-resolutions {camera_res_args} '
-        f'--onnx {File(f"models/{file_prefix}driving_supercombo.onnx").abspath} '
-        f'--output {target_pkl_path} --frame-skip {frame_skip}')
+         f'--model-size {model_w}x{model_h} '
+         f'--camera-resolutions {camera_res_args} '
+         f'--onnx {File(f"models/{file_prefix}driving_supercombo.onnx").abspath} '
+         f'--output {target_pkl_path} --frame-skip {frame_skip}{failure_marker_arg}')
   onnx_sizes_sum = sum(os.path.getsize(f) for f in driving_onnx_deps)
   chunk_targets = get_chunk_targets(target_pkl_path, estimate_pickle_max_size(onnx_sizes_sum))
   def do_chunk(target, source, env, pkl=target_pkl_path, chunks=chunk_targets):
-    chunk_file(pkl, chunks)
+    tmp_chunks = [f"{path}.tmp.{os.getpid()}" for path in chunks]
+    manifest, *published_chunks = chunks
+    tmp_manifest, *generated_chunks = tmp_chunks
+    try:
+      # Generate a complete invisible set first. Publish the manifest last so
+      # readers never observe a mixed old/new chunk set.
+      chunk_file(pkl, tmp_chunks)
+      try:
+        os.unlink(manifest)
+      except FileNotFoundError:
+        pass
+      for generated, published in zip(generated_chunks, published_chunks, strict=True):
+        os.replace(generated, published)
+      os.replace(tmp_manifest, manifest)
+    except Exception:
+      for path in [pkl, manifest, *published_chunks, *tmp_chunks]:
+        try:
+          os.unlink(path)
+        except OSError:
+          pass
+      raise
+    finally:
+      for path in tmp_chunks:
+        try:
+          os.unlink(path)
+        except OSError:
+          pass
   node = lenv.Command(
     chunk_targets,
     tinygrad_files + compile_modeld_script + driving_onnx_deps + [Value(chunk_targets), chunker_file],

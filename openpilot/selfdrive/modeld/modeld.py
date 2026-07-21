@@ -37,6 +37,7 @@ SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 USBGPU_ATTACH_TIMEOUT = float(os.getenv("USBGPU_ATTACH_TIMEOUT_SEC", "30"))
 USBGPU_READY_TIMEOUT = float(os.getenv("USBGPU_READY_TIMEOUT_SEC", "15"))
 USBGPU_STABLE_DURATION = float(os.getenv("USBGPU_STABLE_DURATION_SEC", "8"))
+USBGPU_RUNTIME_HCQ_TIMEOUT_MS = int(os.getenv("USBGPU_RUNTIME_HCQ_TIMEOUT_MS", "2000"))
 
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
@@ -87,6 +88,75 @@ def log_egpu_diagnostics(error: BaseException):
   except Exception:
     cloudlog.exception("USB GPU diagnostic collection failed")
   return diagnostic_path
+
+
+def _opened_usbgpu_device(model=None):
+  from tinygrad.device import Device
+  device_name = Device.canonicalize(getattr(model, "QUEUE_DEV", "AMD"))
+  return Device[device_name] if device_name in Device._opened_devices else None
+
+
+def mark_usbgpu_device_lost(model=None, error: Exception | None = None):
+  try:
+    device = _opened_usbgpu_device(model)
+    if device is not None and callable(marker := getattr(device, "mark_device_lost", None)):
+      marker(error or RuntimeError("USB GPU session abandoned by modeld"))
+  except Exception:
+    cloudlog.exception("Failed to mark USB GPU device session lost")
+
+
+def configure_usbgpu_runtime(model):
+  try:
+    device = _opened_usbgpu_device(model)
+    if device is None:
+      raise RuntimeError("initialized AMD device is not registered")
+    device.wait_timeout_ms = USBGPU_RUNTIME_HCQ_TIMEOUT_MS
+  except Exception:
+    cloudlog.exception("Failed to configure USB GPU runtime timeout")
+    raise
+
+
+def record_usbgpu_failure(params: Params, error: str):
+  params.put_bool("UsbGpuPresent", usbgpu_present())
+  params.put_bool("UsbGpuReady", False)
+  params.put("UsbGpuInitError", error)
+
+
+def switch_to_qcom(model, cam_w: int, cam_h: int, error: Exception | None = None, mark_lost: bool = True):
+  lat_delay = getattr(model, "lat_delay", None)
+  if mark_lost:
+    mark_usbgpu_device_lost(model, error)
+  replacement = ModelState(cam_w, cam_h, usbgpu=False)
+  if lat_delay is not None:
+    replacement.lat_delay = lat_delay
+  return replacement
+
+
+def fail_over_usbgpu(model, cam_w: int, cam_h: int, params: Params, error: Exception):
+  """Poison AMD and publish fallback state before any slow diagnostics."""
+  mark_usbgpu_device_lost(model, error)
+  reason = f"{type(error).__name__}: {error}"
+  record_usbgpu_failure(params, reason)
+  return switch_to_qcom(model, cam_w, cam_h, error, mark_lost=False), reason
+
+
+def finish_usbgpu_startup(model, cam_w: int, cam_h: int, params: Params):
+  if not wait_for_usbgpu_ready(USBGPU_READY_TIMEOUT, stable_duration=USBGPU_STABLE_DURATION):
+    error = "AMD probe succeeded but USB device did not remain configured at SuperSpeed"
+    cloudlog.error("USB GPU probe succeeded without stable configured SuperSpeed readiness; falling back to QCOM")
+    replacement, _ = fail_over_usbgpu(model, cam_w, cam_h, params, RuntimeError(error))
+    return replacement, False
+
+  try:
+    configure_usbgpu_runtime(model)
+  except Exception as e:
+    error = f"Failed to configure AMD runtime: {type(e).__name__}: {e}"
+    replacement, _ = fail_over_usbgpu(model, cam_w, cam_h, params, RuntimeError(error))
+    return replacement, False
+  params.put_bool("UsbGpuPresent", usbgpu_present())
+  params.put_bool("UsbGpuReady", True)
+  params.remove("UsbGpuInitError")
+  return model, True
 
 
 class FrameMeta:
@@ -221,20 +291,13 @@ def main(demo=False):
     if not USBGPU:
       raise
 
-    diagnostic_path = log_egpu_diagnostics(e)
-    params.put_bool("UsbGpuReady", False)
-    params.put("UsbGpuInitError", f"{type(e).__name__}: {e}; diagnostics={diagnostic_path}")
-    cloudlog.exception("USB GPU model initialization failed, falling back to QCOM")
     USBGPU = False
-    model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
+    model, failure_reason = fail_over_usbgpu(None, vipc_client_main.width, vipc_client_main.height, params, e)
+    diagnostic_path = log_egpu_diagnostics(e)
+    record_usbgpu_failure(params, f"{failure_reason}; diagnostics={diagnostic_path}")
+    cloudlog.exception("USB GPU model initialization failed, falling back to QCOM")
   if USBGPU:
-    ready = wait_for_usbgpu_ready(USBGPU_READY_TIMEOUT, stable_duration=USBGPU_STABLE_DURATION)
-    params.put_bool("UsbGpuReady", ready)
-    if ready:
-      params.remove("UsbGpuInitError")
-    else:
-      params.put("UsbGpuInitError", "AMD probe succeeded but USB device did not remain configured at SuperSpeed")
-      cloudlog.error("USB GPU probe succeeded without stable configured SuperSpeed readiness")
+    model, USBGPU = finish_usbgpu_startup(model, vipc_client_main.width, vipc_client_main.height, params)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging
@@ -355,14 +418,11 @@ def main(demo=False):
       if not USBGPU:
         raise
 
-      diagnostic_path = log_egpu_diagnostics(e)
-      params.put_bool("UsbGpuReady", False)
-      params.put("UsbGpuInitError", f"{type(e).__name__}: {e}; diagnostics={diagnostic_path}")
-      cloudlog.exception("USB GPU model execution failed, falling back to QCOM")
       USBGPU = False
-      lat_delay = model.lat_delay
-      model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
-      model.lat_delay = lat_delay
+      model, failure_reason = fail_over_usbgpu(model, vipc_client_main.width, vipc_client_main.height, params, e)
+      diagnostic_path = log_egpu_diagnostics(e)
+      record_usbgpu_failure(params, f"{failure_reason}; diagnostics={diagnostic_path}")
+      cloudlog.exception("USB GPU model execution failed, falling back to QCOM")
       bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
       transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
       model_output = model.run(bufs, transforms, inputs)

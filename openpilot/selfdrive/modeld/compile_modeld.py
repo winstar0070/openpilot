@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import atexit
+import glob
 import math
 import os
 import pickle
+from pathlib import Path
 import tempfile
 import time
 import shutil
@@ -298,7 +300,71 @@ def read_file_chunked_to_disk(path):
   return tmp_path
 
 
-if __name__ == "__main__":
+def _exception_chain(exc: BaseException):
+  seen: set[int] = set()
+  while exc is not None and id(exc) not in seen:
+    seen.add(id(exc))
+    yield exc
+    exc = exc.__cause__ or exc.__context__
+
+
+def usbgpu_session_failure_reason(exc: BaseException) -> str | None:
+  """Return a concise marker reason for failures that invalidate an AMD USB session."""
+  failure_messages = (
+    "tlp completion status: unsupported request",
+    "tlp completion status: completer abort",
+    "libusb_error_no_device",
+    "libusb_error_io",
+    "no such device (it may have been disconnected)",
+  )
+  for error in _exception_chain(exc):
+    if type(error).__name__ == "USBDeviceSessionLost" or any(msg in str(error).lower() for msg in failure_messages):
+      return f"{type(error).__name__}: {error}"
+  return None
+
+
+def cleanup_compile_outputs(output: str) -> None:
+  paths = [output, f"{output}.chunkmanifest", *glob.glob(f"{glob.escape(output)}.chunk*of*")]
+  for path in paths:
+    try:
+      os.unlink(path)
+    except OSError:
+      pass
+
+
+def write_failure_marker(path: str, reason: str) -> None:
+  marker = Path(path)
+  marker.parent.mkdir(parents=True, exist_ok=True)
+  with tempfile.NamedTemporaryFile("w", dir=marker.parent, prefix=f".{marker.name}.", delete=False) as f:
+    tmp_path = f.name
+    f.write(reason.rstrip() + "\n")
+  os.replace(tmp_path, marker)
+
+
+def dump_oob_atomic(obj, output: str) -> None:
+  output_path = Path(output)
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  tmp_path = None
+  try:
+    with tempfile.NamedTemporaryFile("wb", dir=output_path.parent, prefix=f".{output_path.name}.", delete=False) as f:
+      tmp_path = f.name
+      dump_oob(obj, f)
+    os.replace(tmp_path, output_path)
+  finally:
+    if tmp_path is not None:
+      try:
+        os.unlink(tmp_path)
+      except FileNotFoundError:
+        pass
+
+
+def handle_compile_failure(output: str, failure_marker: str | None, exc: BaseException) -> None:
+  if failure_marker and (reason := usbgpu_session_failure_reason(exc)) is not None:
+    write_failure_marker(failure_marker, reason)
+  cleanup_compile_outputs(output)
+
+
+def main() -> None:
   from tinygrad.nn.onnx import OnnxRunner
   from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
   from openpilot.selfdrive.modeld.get_model_metadata import make_metadata_dict
@@ -309,28 +375,42 @@ if __name__ == "__main__":
   p.add_argument('--onnx', required=True)
   p.add_argument('--output', required=True)
   p.add_argument('--frame-skip', type=int, required=True)
+  p.add_argument('--failure-marker', help='write USB GPU session-loss reason to this path')
   args = p.parse_args()
 
-  model_path = read_file_chunked_to_disk(args.onnx)
-  model_w, model_h = args.model_size
+  if args.failure_marker:
+    try:
+      os.unlink(args.failure_marker)
+    except FileNotFoundError:
+      pass
 
-  model_runner = OnnxRunner(model_path)
-  out = {'metadata': make_metadata_dict(model_path)}
+  try:
+    model_path = read_file_chunked_to_disk(args.onnx)
+    model_w, model_h = args.model_size
 
-  run_policy_jit = TinyJit(make_run_policy(model_runner, out['metadata'], args.frame_skip), prune=True)
+    model_runner = OnnxRunner(model_path)
+    out = {'metadata': make_metadata_dict(model_path)}
 
-  make_policy_queues = partial(make_input_queues, out['metadata']['input_shapes'], args.frame_skip)
-  make_random_model_inputs = partial(make_random_images, keys=['warped'], shape=(2, 6, *out['metadata']['input_shapes']['img'][2:]), device=WARP_DEV)
-  out['run_policy'] = compile_jit(run_policy_jit, make_random_model_inputs, POLICY_INPUTS,
-                                  make_policy_queues)
+    run_policy_jit = TinyJit(make_run_policy(model_runner, out['metadata'], args.frame_skip), prune=True)
 
-  for cam_w, cam_h in args.camera_resolutions:
-    nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
-    make_random_warp_inputs = partial(make_random_images, keys=['frame', 'big_frame'], shape=nv12.size, device=WARP_DEV)
-    warp = TinyJit(make_warp(nv12, model_w, model_h, args.frame_skip), prune=True)
-    make_warp_queues = partial(make_warp_input_queues, out['metadata']['input_shapes'], args.frame_skip)
-    out[(cam_w,cam_h)] = compile_jit(warp, make_random_warp_inputs, WARP_INPUTS, make_warp_queues)
+    make_policy_queues = partial(make_input_queues, out['metadata']['input_shapes'], args.frame_skip)
+    make_random_model_inputs = partial(make_random_images, keys=['warped'], shape=(2, 6, *out['metadata']['input_shapes']['img'][2:]), device=WARP_DEV)
+    out['run_policy'] = compile_jit(run_policy_jit, make_random_model_inputs, POLICY_INPUTS,
+                                    make_policy_queues)
 
-  with open(args.output, "wb") as f:
-    dump_oob(out, f)
-  print(f"Saved JITs to {args.output} ({os.path.getsize(args.output) / 1e6:.2f} MB)")
+    for cam_w, cam_h in args.camera_resolutions:
+      nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
+      make_random_warp_inputs = partial(make_random_images, keys=['frame', 'big_frame'], shape=nv12.size, device=WARP_DEV)
+      warp = TinyJit(make_warp(nv12, model_w, model_h, args.frame_skip), prune=True)
+      make_warp_queues = partial(make_warp_input_queues, out['metadata']['input_shapes'], args.frame_skip)
+      out[(cam_w,cam_h)] = compile_jit(warp, make_random_warp_inputs, WARP_INPUTS, make_warp_queues)
+
+    dump_oob_atomic(out, args.output)
+    print(f"Saved JITs to {args.output} ({os.path.getsize(args.output) / 1e6:.2f} MB)")
+  except Exception as exc:
+    handle_compile_failure(args.output, args.failure_marker, exc)
+    raise
+
+
+if __name__ == "__main__":
+  main()

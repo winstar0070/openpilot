@@ -2,16 +2,18 @@ import tempfile
 from pathlib import Path
 
 from openpilot.selfdrive.modeld import helpers
-from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_speed, usbgpu_superspeed_ready, wait_for_usbgpu_present, wait_for_usbgpu_ready
+from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_ready_identity, usbgpu_speed, usbgpu_superspeed_ready
+from openpilot.selfdrive.modeld.helpers import wait_for_usbgpu_present, wait_for_usbgpu_ready
 
 
-def add_usb_device(root: Path, name: str, speed: int, configuration: str = "1") -> Path:
+def add_usb_device(root: Path, name: str, speed: int, configuration: str = "1", devnum: int = 1) -> Path:
   device = root / name
   device.mkdir()
   (device / "idVendor").write_text("add1\n")
   (device / "idProduct").write_text("0001\n")
   (device / "speed").write_text(f"{speed}\n")
   (device / "bConfigurationValue").write_text(f"{configuration}\n")
+  (device / "devnum").write_text(f"{devnum}\n")
   return device
 
 
@@ -31,6 +33,7 @@ def test_superspeed_is_ready():
     assert usbgpu_present(sysfs_root)
     assert usbgpu_speed(sysfs_root) == 5000
     assert usbgpu_superspeed_ready(sysfs_root)
+    assert usbgpu_ready_identity(sysfs_root) == (str(sysfs_root / "4-1"), 1, 5000, 1)
     assert wait_for_usbgpu_ready(0, sysfs_root=sysfs_root)
 
 
@@ -104,3 +107,21 @@ def test_wait_for_ready_requires_continuous_stability(monkeypatch):
     monkeypatch.setattr(helpers.time, "monotonic", lambda: elapsed)
     assert wait_for_usbgpu_ready(10, stable_duration=3, poll_interval=1, sysfs_root=sysfs_root)
     assert elapsed == 6.0
+
+
+def test_wait_for_ready_restarts_stability_when_devnum_changes(monkeypatch):
+  with tempfile.TemporaryDirectory() as tempdir:
+    sysfs_root = Path(tempdir)
+    device = add_usb_device(sysfs_root, "4-1", 5000, devnum=2)
+    elapsed = 0.0
+
+    def sleep(interval: float):
+      nonlocal elapsed
+      elapsed += interval
+      if elapsed == 2.0:
+        (device / "devnum").write_text("3\n")
+
+    monkeypatch.setattr(helpers.time, "sleep", sleep)
+    monkeypatch.setattr(helpers.time, "monotonic", lambda: elapsed)
+    assert wait_for_usbgpu_ready(10, stable_duration=3, poll_interval=1, sysfs_root=sysfs_root)
+    assert elapsed == 5.0

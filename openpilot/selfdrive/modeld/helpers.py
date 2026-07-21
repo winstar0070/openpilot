@@ -82,30 +82,41 @@ def usbgpu_speed(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> int | None:
       pass
   return max(speeds, default=None)
 
-def usbgpu_superspeed_ready(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
+
+def usbgpu_ready_identity(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> tuple[str, int, int, int] | None:
+  identities = []
   for d in _usbgpu_devices(sysfs_root):
     try:
       speed = int(float((d / "speed").read_text().strip()))
       configuration = int((d / "bConfigurationValue").read_text().strip())
+      devnum = int((d / "devnum").read_text().strip())
       if speed >= USBGPU_SUPERSPEED_MBIT and configuration > 0:
-        return True
+        identities.append((str(d), devnum, speed, configuration))
     except (OSError, ValueError):
       pass
-  return False
+  return min(identities, default=None)
+
+
+def usbgpu_superspeed_ready(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
+  return usbgpu_ready_identity(sysfs_root) is not None
 
 def wait_for_usbgpu_ready(timeout: float, stable_duration: float = 0.0, poll_interval: float = 0.1,
                           sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
   deadline = time.monotonic() + timeout
   stable_since = None
+  stable_identity = None
   while True:
     now = time.monotonic()
-    if usbgpu_superspeed_ready(sysfs_root):
-      if stable_since is None:
+    identity = usbgpu_ready_identity(sysfs_root)
+    if identity is not None:
+      if stable_since is None or identity != stable_identity:
         stable_since = now
+        stable_identity = identity
       if now - stable_since >= stable_duration:
         return True
     else:
       stable_since = None
+      stable_identity = None
     if time.monotonic() >= deadline:
       return False
     time.sleep(poll_interval)

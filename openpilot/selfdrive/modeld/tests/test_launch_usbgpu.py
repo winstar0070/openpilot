@@ -134,3 +134,41 @@ def test_prepare_usbgpu_hands_low_speed_bootstrap_device_to_tinygrad():
     assert "USB GPU bootstrap device detected; handing off to tinygrad" in result.stdout
     assert (driver_root / "unbind").read_text() == ""
     assert (driver_root / "bind").read_text() == ""
+
+
+def test_prepare_usbgpu_recovers_usb2_device_instead_of_handing_off():
+  with tempfile.TemporaryDirectory() as tempdir:
+    root = Path(tempdir)
+    usb_root, platform_root, driver_root = make_fake_xhci(root)
+    (driver_root / "bind").write_text("")
+    (driver_root / "unbind").write_text("")
+    speeds = root / "speeds"
+    speeds.write_text("480\n5000\n5000\n")
+
+    script = f'''
+      export USBGPU_USB_SYSFS_ROOT="{usb_root}"
+      export USBGPU_PLATFORM_SYSFS_ROOT="{platform_root}"
+      export USBGPU_ATTACH_TIMEOUT_SEC=1
+      export USBGPU_RECOVERY_TIMEOUT_SEC=2
+      export USBGPU_STABLE_SECONDS=1
+      export USBGPU_RECOVERY_ATTEMPTS=1
+      export USBGPU_REBIND_DELAY_SEC=0
+      source "{LAUNCH_SCRIPT}"
+      usbgpu_speed() {{
+        local speed
+        speed="$(head -n 1 "{speeds}")"
+        tail -n +2 "{speeds}" > "{speeds}.tmp"
+        [ -s "{speeds}.tmp" ] && mv "{speeds}.tmp" "{speeds}"
+        echo "${{speed:-0}}"
+      }}
+      sleep() {{ :; }}
+      sudo() {{ "$@"; }}
+      prepare_usbgpu
+    '''
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+
+    assert "USB GPU detected at 480M" in result.stdout
+    assert "handing off to tinygrad" not in result.stdout
+    assert "Resetting xhci-hcd.1.auto" in result.stdout
+    assert "USB GPU ready at 5000M" in result.stdout
+    assert (driver_root / "unbind").read_text() == "xhci-hcd.1.auto\n"
