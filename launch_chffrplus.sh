@@ -4,6 +4,17 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
 
 source "$DIR/launch_env.sh"
 
+USBGPU_USB_SYSFS_ROOT="${USBGPU_USB_SYSFS_ROOT:-/sys/bus/usb/devices}"
+USBGPU_PLATFORM_SYSFS_ROOT="${USBGPU_PLATFORM_SYSFS_ROOT:-/sys/bus/platform/devices}"
+USBGPU_ATTACH_TIMEOUT_SEC="${USBGPU_ATTACH_TIMEOUT_SEC:-10}"
+USBGPU_INITIAL_STABILITY_TIMEOUT_SEC="${USBGPU_INITIAL_STABILITY_TIMEOUT_SEC:-12}"
+USBGPU_RECOVERY_TIMEOUT_SEC="${USBGPU_RECOVERY_TIMEOUT_SEC:-30}"
+USBGPU_STABLE_SECONDS="${USBGPU_STABLE_SECONDS:-8}"
+USBGPU_LOW_SPEED_GRACE_SEC="${USBGPU_LOW_SPEED_GRACE_SEC:-5}"
+USBGPU_RECOVERY_ATTEMPTS="${USBGPU_RECOVERY_ATTEMPTS:-3}"
+USBGPU_REBIND_DELAY_SEC="${USBGPU_REBIND_DELAY_SEC:-3}"
+USBGPU_RETRY_DELAY_SEC="${USBGPU_RETRY_DELAY_SEC:-5}"
+
 function agnos_init {
   # TODO: move this to agnos
   sudo rm -f /data/etc/NetworkManager/system-connections/*.nmmeta
@@ -30,7 +41,7 @@ function agnos_init {
 
 function usbgpu_speed {
   local usbgpu_device usbgpu_speed_candidate usbgpu_speed_value=0
-  for usbgpu_device in /sys/bus/usb/devices/*; do
+  for usbgpu_device in "$USBGPU_USB_SYSFS_ROOT"/*; do
     [ -f "$usbgpu_device/idVendor" ] || continue
     [ -f "$usbgpu_device/idProduct" ] || continue
     [ "$(< "$usbgpu_device/idVendor")" = "add1" ] || continue
@@ -45,31 +56,70 @@ function usbgpu_speed {
   echo "$usbgpu_speed_value"
 }
 
+function wait_for_usbgpu_stable {
+  local usbgpu_timeout="$1"
+  local usbgpu_break_on_low_speed="$2"
+  local usbgpu_current_speed usbgpu_elapsed usbgpu_stable_seconds=0 usbgpu_slow_seconds=0
+
+  for ((usbgpu_elapsed = 0; usbgpu_elapsed < usbgpu_timeout; usbgpu_elapsed++)); do
+    usbgpu_current_speed="$(usbgpu_speed)"
+    if [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
+      usbgpu_stable_seconds=$((usbgpu_stable_seconds + 1))
+      usbgpu_slow_seconds=0
+      [ "$usbgpu_stable_seconds" -ge "$USBGPU_STABLE_SECONDS" ] && return 0
+    elif [ "$usbgpu_current_speed" -gt 0 ] 2>/dev/null; then
+      usbgpu_stable_seconds=0
+      usbgpu_slow_seconds=$((usbgpu_slow_seconds + 1))
+      if [ "$usbgpu_break_on_low_speed" = "1" ] && [ "$usbgpu_slow_seconds" -ge "$USBGPU_LOW_SPEED_GRACE_SEC" ]; then
+        return 1
+      fi
+    else
+      usbgpu_stable_seconds=0
+      usbgpu_slow_seconds=0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 function prepare_usbgpu {
   local usbgpu_xhci_device="xhci-hcd.1.auto"
-  local usbgpu_xhci_path="/sys/bus/platform/devices/$usbgpu_xhci_device"
+  local usbgpu_xhci_path="$USBGPU_PLATFORM_SYSFS_ROOT/$usbgpu_xhci_device"
   local usbgpu_xhci_driver usbgpu_current_speed
-  local usbgpu_attempt usbgpu_stable_seconds usbgpu_slow_seconds
+  local usbgpu_attempt usbgpu_waited
 
   [ -L "$usbgpu_xhci_path/driver" ] || return
-  usbgpu_current_speed="$(usbgpu_speed)"
-  [ "$usbgpu_current_speed" -gt 0 ] 2>/dev/null || return
-  [ "$usbgpu_current_speed" -lt 5000 ] 2>/dev/null || return
+
+  for ((usbgpu_waited = 0; usbgpu_waited < USBGPU_ATTACH_TIMEOUT_SEC; usbgpu_waited++)); do
+    usbgpu_current_speed="$(usbgpu_speed)"
+    [ "$usbgpu_current_speed" -gt 0 ] 2>/dev/null && break
+    sleep 1
+  done
+  if ! [ "$usbgpu_current_speed" -gt 0 ] 2>/dev/null; then
+    echo "USB GPU not detected within ${USBGPU_ATTACH_TIMEOUT_SEC}s; modeld will fall back to QCOM"
+    return
+  fi
 
   usbgpu_xhci_driver="$(readlink -f "$usbgpu_xhci_path/driver")"
   [ -d "$usbgpu_xhci_driver" ] || return
   echo "USB GPU detected at ${usbgpu_current_speed}M"
 
-  for usbgpu_attempt in {1..3}; do
-    usbgpu_stable_seconds=0
-    usbgpu_slow_seconds=0
-    echo "Resetting $usbgpu_xhci_device (attempt $usbgpu_attempt/3)"
+  if [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
+    if wait_for_usbgpu_stable "$USBGPU_INITIAL_STABILITY_TIMEOUT_SEC" 0; then
+      echo "USB GPU ready at ${usbgpu_current_speed}M"
+      return
+    fi
+    echo "USB GPU SuperSpeed link was not stable; resetting controller"
+  fi
+
+  for ((usbgpu_attempt = 1; usbgpu_attempt <= USBGPU_RECOVERY_ATTEMPTS; usbgpu_attempt++)); do
+    echo "Resetting $usbgpu_xhci_device (attempt $usbgpu_attempt/$USBGPU_RECOVERY_ATTEMPTS)"
 
     if ! echo "$usbgpu_xhci_device" | sudo tee "$usbgpu_xhci_driver/unbind" > /dev/null; then
       echo "Failed to unbind $usbgpu_xhci_device"
       return
     fi
-    sleep 3
+    sleep "$USBGPU_REBIND_DELAY_SEC"
     if ! echo "$usbgpu_xhci_device" | sudo tee "$usbgpu_xhci_driver/bind" > /dev/null; then
       echo "Failed to bind $usbgpu_xhci_device"
       return
@@ -77,29 +127,16 @@ function prepare_usbgpu {
 
     # Require eight continuous seconds at SuperSpeed. A stable low-speed
     # enumeration cannot upgrade in place, so retry it without waiting longer.
-    for _ in {1..30}; do
+    if wait_for_usbgpu_stable "$USBGPU_RECOVERY_TIMEOUT_SEC" 1; then
       usbgpu_current_speed="$(usbgpu_speed)"
-      if [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
-        usbgpu_stable_seconds=$((usbgpu_stable_seconds + 1))
-        usbgpu_slow_seconds=0
-        if [ "$usbgpu_stable_seconds" -ge 8 ]; then
-          echo "USB GPU ready at ${usbgpu_current_speed}M"
-          return
-        fi
-      elif [ "$usbgpu_current_speed" -gt 0 ] 2>/dev/null; then
-        usbgpu_stable_seconds=0
-        usbgpu_slow_seconds=$((usbgpu_slow_seconds + 1))
-        [ "$usbgpu_slow_seconds" -ge 5 ] && break
-      else
-        usbgpu_stable_seconds=0
-        usbgpu_slow_seconds=0
-      fi
-      sleep 1
-    done
+      echo "USB GPU ready at ${usbgpu_current_speed}M"
+      return
+    fi
 
-    if [ "$usbgpu_attempt" -lt 3 ]; then
-      echo "USB GPU remained at ${usbgpu_current_speed}M; retrying in 5 seconds"
-      sleep 5
+    usbgpu_current_speed="$(usbgpu_speed)"
+    if [ "$usbgpu_attempt" -lt "$USBGPU_RECOVERY_ATTEMPTS" ]; then
+      echo "USB GPU remained at ${usbgpu_current_speed}M; retrying in ${USBGPU_RETRY_DELAY_SEC} seconds"
+      sleep "$USBGPU_RETRY_DELAY_SEC"
     fi
   done
   echo "USB GPU did not remain at SuperSpeed; modeld will fall back to QCOM"
@@ -175,4 +212,6 @@ function launch {
   while true; do sleep 1; done
 }
 
-launch
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  launch
+fi

@@ -65,6 +65,14 @@ def _usbgpu_devices(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> list[Path]:
 def usbgpu_present(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
   return bool(_usbgpu_devices(sysfs_root))
 
+def wait_for_usbgpu_present(timeout: float, poll_interval: float = 0.1, sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
+  deadline = time.monotonic() + timeout
+  while not usbgpu_present(sysfs_root):
+    if time.monotonic() >= deadline:
+      return False
+    time.sleep(poll_interval)
+  return True
+
 def usbgpu_speed(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> int | None:
   speeds = []
   for d in _usbgpu_devices(sysfs_root):

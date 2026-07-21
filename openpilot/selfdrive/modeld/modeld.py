@@ -26,7 +26,7 @@ from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_drivi
 from openpilot.common.file_chunker import open_file_chunked, get_manifest_path
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.egpu_diagnostics import collect_egpu_diagnostics
-from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_speed, usbgpu_superspeed_ready, wait_for_usbgpu_ready
+from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_speed, usbgpu_superspeed_ready, wait_for_usbgpu_present, wait_for_usbgpu_ready
 from openpilot.selfdrive.modeld.helpers import modeld_pkl_path, get_tg_input_devices, load_oob
 
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
@@ -34,6 +34,7 @@ from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
+USBGPU_ATTACH_TIMEOUT = 2.0
 
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
@@ -66,6 +67,24 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
   return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature),
                                 desiredAcceleration=float(desired_accel),
                                 shouldStop=bool(should_stop))
+
+
+def log_egpu_diagnostics(error: BaseException):
+  diagnostic_path = None
+  try:
+    diagnostic_path, diagnostics = collect_egpu_diagnostics(error)
+    diagnostic_summary = {
+      "path": str(diagnostic_path) if diagnostic_path is not None else None,
+      "egpuDevices": diagnostics.get("egpuDevices", []),
+      "xhci": diagnostics.get("xhci", {}),
+      "systemPower": diagnostics.get("systemPower", {}),
+      "kernelLogError": diagnostics.get("kernelLog", {}).get("error"),
+      "saveError": diagnostics.get("saveError"),
+    }
+    cloudlog.error(f"USB GPU diagnostics: {json.dumps(diagnostic_summary, separators=(',', ':'))}")
+  except Exception:
+    cloudlog.exception("USB GPU diagnostic collection failed")
+  return diagnostic_path
 
 
 class FrameMeta:
@@ -144,8 +163,8 @@ class ModelState(ModelStateBase):
 def main(demo=False):
   cloudlog.warning("modeld init")
 
-  _present = usbgpu_present()
   _compiled = os.path.isfile(get_manifest_path(modeld_pkl_path(usbgpu=True)))
+  _present = usbgpu_present() or (_compiled and wait_for_usbgpu_present(USBGPU_ATTACH_TIMEOUT))
   USBGPU = _present and _compiled
   params = Params()
   params.put_bool("UsbGpuPresent", _present)
@@ -188,8 +207,9 @@ def main(demo=False):
     if not USBGPU:
       raise
 
+    diagnostic_path = log_egpu_diagnostics(e)
     params.put_bool("UsbGpuReady", False)
-    params.put("UsbGpuInitError", f"{type(e).__name__}: {e}")
+    params.put("UsbGpuInitError", f"{type(e).__name__}: {e}; diagnostics={diagnostic_path}")
     cloudlog.exception("USB GPU model initialization failed, falling back to QCOM")
     USBGPU = False
     model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
@@ -321,20 +341,7 @@ def main(demo=False):
       if not USBGPU:
         raise
 
-      diagnostic_path = None
-      try:
-        diagnostic_path, diagnostics = collect_egpu_diagnostics(e)
-        diagnostic_summary = {
-          "path": str(diagnostic_path) if diagnostic_path is not None else None,
-          "egpuDevices": diagnostics.get("egpuDevices", []),
-          "xhci": diagnostics.get("xhci", {}),
-          "systemPower": diagnostics.get("systemPower", {}),
-          "kernelLogError": diagnostics.get("kernelLog", {}).get("error"),
-          "saveError": diagnostics.get("saveError"),
-        }
-        cloudlog.error(f"USB GPU diagnostics: {json.dumps(diagnostic_summary, separators=(',', ':'))}")
-      except Exception:
-        cloudlog.exception("USB GPU diagnostic collection failed")
+      diagnostic_path = log_egpu_diagnostics(e)
       params.put_bool("UsbGpuReady", False)
       params.put("UsbGpuInitError", f"{type(e).__name__}: {e}; diagnostics={diagnostic_path}")
       cloudlog.exception("USB GPU model execution failed, falling back to QCOM")
