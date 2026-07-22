@@ -35,7 +35,10 @@ def test_collects_egpu_state_and_filtered_kernel_log(monkeypatch):
     assert diagnostics["egpuDevices"][0]["speed"] == "5000"
     assert diagnostics["egpuDevices"][0]["power_runtime_status"] == "active"
     assert diagnostics["kernelLog"]["lines"] == ["xhci controller reset", "usb 4-1 disconnect"]
-    assert json.loads((log_root / "latest.json").read_text())["error"]["message"] == "read failed"
+    saved_error = json.loads((log_root / "latest.json").read_text())["error"]
+    assert saved_error["message"] == "read failed"
+    assert "RuntimeError: read failed" in saved_error["traceback"]
+    assert "NoneType: None" not in saved_error["traceback"]
 
 
 def test_kernel_log_failure_does_not_block_diagnostic_file(monkeypatch):
@@ -70,3 +73,16 @@ def test_retains_only_recent_historical_logs(monkeypatch):
     assert path is not None
     historical_logs = [p for p in log_root.glob("*.json") if p.name != "latest.json"]
     assert len(historical_logs) == MAX_LOG_FILES
+
+
+def test_uses_traceback_captured_before_async_collection(monkeypatch, tmp_path):
+  usb_root, xhci_path, log_root = tmp_path / "usb", tmp_path / "xhci", tmp_path / "logs"
+  usb_root.mkdir()
+  monkeypatch.setattr(egpu_diagnostics.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""))
+
+  _, diagnostics = collect_egpu_diagnostics(
+    RuntimeError("synthetic"), log_root, usb_root, xhci_path,
+    traceback_text="Traceback (most recent call last):\nRuntimeError: original failure\n",
+  )
+
+  assert diagnostics["error"]["traceback"].endswith("RuntimeError: original failure\n")

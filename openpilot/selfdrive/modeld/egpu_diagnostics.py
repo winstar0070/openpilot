@@ -98,15 +98,20 @@ def _kernel_log() -> dict:
 
 
 def collect_egpu_diagnostics(error: BaseException, log_root: Path = EGPU_LOG_ROOT,
-                             usb_sysfs_root: Path = USB_SYSFS_ROOT,
-                             xhci_sysfs_path: Path = XHCI_SYSFS_PATH,
-                             system_sysfs_root: Path = SYSTEM_SYSFS_ROOT) -> tuple[Path | None, dict]:
+                              usb_sysfs_root: Path = USB_SYSFS_ROOT,
+                              xhci_sysfs_path: Path = XHCI_SYSFS_PATH,
+                              system_sysfs_root: Path = SYSTEM_SYSFS_ROOT,
+                              traceback_text: str | None = None) -> tuple[Path | None, dict]:
   now = datetime.now().astimezone()
   diagnostics = {
     "timestamp": now.isoformat(),
     "systemTimeValid": system_time_valid(),
     "pid": os.getpid(),
-    "error": {"type": type(error).__name__, "message": str(error), "traceback": traceback.format_exc()},
+    "error": {
+      "type": type(error).__name__,
+      "message": str(error),
+      "traceback": traceback_text or "".join(traceback.format_exception(error)),
+    },
     "egpuDevices": _egpu_devices(usb_sysfs_root),
     "xhci": _xhci_state(xhci_sysfs_path),
     "systemPower": _system_power_state(system_sysfs_root),

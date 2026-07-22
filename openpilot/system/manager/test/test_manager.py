@@ -74,4 +74,113 @@ class TestManager:
         exit_codes = [0, 1]
         if p.sigkill:
           exit_codes = [-signal.SIGKILL]
-        assert exit_code in exit_codes, f"{p.name} died with {exit_code}"
+      assert exit_code in exit_codes, f"{p.name} died with {exit_code}"
+
+
+def test_usbgpu_lockout_survives_same_ignition_manager_restart(monkeypatch):
+  cleared = []
+  monkeypatch.setattr(manager, "clear_usbgpu_ignition_lockout", lambda: cleared.append(True))
+
+  assert manager.update_usbgpu_ignition_lockout(started=True, last_valid_started=None) is True
+  assert cleared == []
+
+
+def test_usbgpu_lockout_ignores_invalid_default_before_started_sample(monkeypatch):
+  cleared = []
+  monkeypatch.setattr(manager, "clear_usbgpu_ignition_lockout", lambda: cleared.append(True))
+
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=False, last_valid_started=None,
+    sample_updated=False, sample_valid=False, sample_alive=False,
+  )
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=False, last_valid_started=last_valid_started,
+    sample_updated=True, sample_valid=False, sample_alive=True,
+  )
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=True, last_valid_started=last_valid_started,
+    sample_updated=True, sample_valid=True, sample_alive=True,
+  )
+
+  assert last_valid_started is True
+  assert cleared == []
+
+
+def test_usbgpu_lockout_clears_on_first_offroad_sample(monkeypatch):
+  cleared = []
+  monkeypatch.setattr(manager, "clear_usbgpu_ignition_lockout", lambda: cleared.append(True))
+
+  assert manager.update_usbgpu_ignition_lockout(started=False, last_valid_started=None) is False
+  assert cleared == [True]
+
+
+def test_usbgpu_lockout_clears_on_normal_offroad_transition(monkeypatch):
+  cleared = []
+  monkeypatch.setattr(manager, "clear_usbgpu_ignition_lockout", lambda: cleared.append(True))
+
+  assert manager.update_usbgpu_ignition_lockout(started=False, last_valid_started=True) is False
+  assert cleared == [True]
+
+
+def test_usbgpu_lockout_uses_last_valid_started_across_invalid_sample(monkeypatch):
+  cleared = []
+  monkeypatch.setattr(manager, "clear_usbgpu_ignition_lockout", lambda: cleared.append(True))
+
+  last_valid_started = manager.update_usbgpu_ignition_lockout(started=True, last_valid_started=None)
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=False, last_valid_started=last_valid_started,
+    sample_updated=True, sample_valid=False, sample_alive=True,
+  )
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=False, last_valid_started=last_valid_started,
+    sample_updated=True, sample_valid=True, sample_alive=True,
+  )
+
+  assert last_valid_started is False
+  assert cleared == [True]
+
+
+def test_usbgpu_lockout_ignores_transient_offroad_while_ignition_is_on(monkeypatch):
+  cleared = []
+  monkeypatch.setattr(manager, "clear_usbgpu_ignition_lockout", lambda: cleared.append(True))
+
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=False, last_valid_started=None, ignition=True, ignition_known=True,
+  )
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=True, last_valid_started=last_valid_started, ignition=True, ignition_known=True,
+  )
+
+  assert last_valid_started is True
+  assert cleared == []
+
+
+def test_usbgpu_lockout_defers_offroad_until_ignition_is_known_off(monkeypatch):
+  cleared = []
+  monkeypatch.setattr(manager, "clear_usbgpu_ignition_lockout", lambda: cleared.append(True))
+
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=False, last_valid_started=True, ignition=False, ignition_known=False,
+  )
+  assert last_valid_started is True
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=False, last_valid_started=last_valid_started, ignition=False, ignition_known=True,
+  )
+
+  assert last_valid_started is False
+  assert cleared == [True]
+
+
+def test_usbgpu_lockout_retries_clear_on_every_confirmed_offroad_sample(monkeypatch):
+  cleared = []
+  monkeypatch.setattr(manager, "clear_usbgpu_ignition_lockout", lambda: cleared.append(True))
+
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=False, last_valid_started=True, ignition=False, ignition_known=True,
+  )
+  last_valid_started = manager.update_usbgpu_ignition_lockout(
+    started=False, last_valid_started=last_valid_started, ignition=False, ignition_known=True,
+  )
+
+  assert last_valid_started is False
+  assert cleared == [True, True]

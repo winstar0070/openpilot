@@ -87,3 +87,38 @@ def test_general_failure_cleans_outputs_without_marker(tmp_path):
   assert not output.exists()
   assert not Path(f"{output}.chunkmanifest").exists()
   assert not marker.exists()
+
+
+def test_marker_failure_does_not_replace_original_or_prevent_cleanup(tmp_path, monkeypatch):
+  output = tmp_path / "model.pkl"
+  output.write_bytes(b"partial")
+  original = USBDeviceSessionLost("link lost")
+
+  def fail_marker(*args):
+    raise RuntimeError("marker transport failed")
+
+  monkeypatch.setattr(compile_modeld, "write_failure_marker", fail_marker)
+  with pytest.raises(USBDeviceSessionLost) as exc_info:
+    try:
+      raise original
+    except USBDeviceSessionLost as exc:
+      compile_modeld.handle_compile_failure(str(output), str(tmp_path / "failure.marker"), exc)
+      raise
+
+  assert exc_info.value is original
+  assert not output.exists()
+
+
+def test_write_failure_marker_cleans_temp_when_replace_fails(tmp_path, monkeypatch):
+  marker = tmp_path / "failure.marker"
+  marker.write_text("old\n")
+
+  def fail_replace(*args):
+    raise PermissionError("read only")
+
+  monkeypatch.setattr(compile_modeld.os, "replace", fail_replace)
+  with pytest.raises(PermissionError, match="read only"):
+    compile_modeld.write_failure_marker(str(marker), "new")
+
+  assert marker.read_text() == "old\n"
+  assert list(tmp_path.glob(".failure.marker.*")) == []

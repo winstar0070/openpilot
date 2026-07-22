@@ -1,14 +1,15 @@
+import fcntl
 import glob
 import json
 import os
 import shlex
 import sys, subprocess
 from SCons.Script import Action, Value
-from openpilot.common.file_chunker import chunk_file, get_chunk_targets, get_existing_chunks
+from openpilot.common.file_chunker import cleanup_incomplete_file_chunks, cleanup_stale_file_chunk_temps, chunk_file, get_chunk_targets, get_existing_chunks
 from openpilot.common.transformations.camera import _ar_ox_fisheye, _os_fisheye
 from openpilot.common.transformations.model import MEDMODEL_INPUT_SIZE, DM_INPUT_SIZE
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.modeld.helpers import TG_INPUT_DEVICES_PATH, usbgpu_present, modeld_pkl_path
+from openpilot.selfdrive.modeld.helpers import TG_INPUT_DEVICES_PATH, USBGPU_SUPERSPEED_MBIT, modeld_pkl_path, usbgpu_speed
 
 
 CAMERA_CONFIGS = [
@@ -55,13 +56,17 @@ tg_devices = { # which device to put jit inputs to at runtime
   },
 }
 
-USBGPU = usbgpu_present() # or release # TODO always build big model on release
+def usbgpu_build_speed_eligible(speed):
+  return speed == 12 or (speed is not None and speed >= USBGPU_SUPERSPEED_MBIT)
+
+
+USBGPU_FORCE_BUILD = os.getenv("USBGPU_FORCE_BUILD") == "1"
+USBGPU = USBGPU_FORCE_BUILD or usbgpu_build_speed_eligible(usbgpu_speed()) # or release # TODO always build big model on release
 if USBGPU:
   usbgpu_tg_flags = f'DEBUG=2 DEV=USB+AMD:LLVM WARP_DEV={tg_backend} FLOAT16=1 JIT_BATCH_SIZE=0 GMMU=0 ' \
                     'USB_REENUM_TIMEOUT_MS=120000 HCQDEV_WAIT_TIMEOUT_MS=10000'
   # the USB+AMD GPU takes an exclusive flock; serialize all targets that touch it
-  usbgpu_lock = File("models/.usb_gpu.lock").abspath
-  usbgpu_failure_marker = os.getenv("USBGPU_BUILD_FAILURE_MARKER", "/tmp/openpilot_usbgpu_build_failure")
+  usbgpu_lock = File(os.getenv("USBGPU_BUILD_LOCK", "models/.usb_gpu.lock")).abspath
 
 def write_tg_devices(target, source, env):
   with open(str(target[0]), "w") as f:
@@ -93,12 +98,11 @@ for usbgpu in [False, True] if USBGPU else [False]:
   file_prefix, cmd_flags = ('big_', usbgpu_tg_flags) if usbgpu else ('big_' if os.getenv('BIG_INTO_SMALL') else '', tg_flags)
   driving_onnx_deps = get_existing_chunks(File(f"models/{file_prefix}driving_supercombo.onnx").abspath)
   camera_res_args = ' '.join(f'{cw}x{ch}' for cw, ch in CAMERA_CONFIGS)
-  failure_marker_arg = f' --failure-marker {shlex.quote(usbgpu_failure_marker)}' if usbgpu else ''
-  cmd = (f'{cmd_flags} {mac_brew_string} python3 {modeld_dir}/compile_modeld.py '
-         f'--model-size {model_w}x{model_h} '
-         f'--camera-resolutions {camera_res_args} '
-         f'--onnx {File(f"models/{file_prefix}driving_supercombo.onnx").abspath} '
-         f'--output {target_pkl_path} --frame-skip {frame_skip}{failure_marker_arg}')
+  compile_cmd = (f'{cmd_flags} {mac_brew_string} python3 {modeld_dir}/compile_modeld.py '
+                 f'--model-size {model_w}x{model_h} '
+                 f'--camera-resolutions {camera_res_args} '
+                 f'--onnx {File(f"models/{file_prefix}driving_supercombo.onnx").abspath} '
+                 f'--output {target_pkl_path} --frame-skip {frame_skip}')
   onnx_sizes_sum = sum(os.path.getsize(f) for f in driving_onnx_deps)
   chunk_targets = get_chunk_targets(target_pkl_path, estimate_pickle_max_size(onnx_sizes_sum))
   def do_chunk(target, source, env, pkl=target_pkl_path, chunks=chunk_targets):
@@ -129,13 +133,40 @@ for usbgpu in [False, True] if USBGPU else [False]:
           os.unlink(path)
         except OSError:
           pass
+  sources = tinygrad_files + compile_modeld_script + driving_onnx_deps + [Value(chunk_targets), chunker_file]
+  if usbgpu:
+    # Track the stable compiler command explicitly. The per-process failure
+    # marker is read when the action executes so it never changes this signature.
+    sources.append(Value(compile_cmd))
+    def do_usbgpu_build(target, source, env, base_command=compile_cmd, pkl=target_pkl_path, lock_path=usbgpu_lock, chunk_action=do_chunk):
+      # This is an OS lock, not only a SCons SideEffect. It also protects stale
+      # temp GC and chunk publication from a second SCons process.
+      with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        cleanup_stale_file_chunk_temps(pkl)
+        cleanup_incomplete_file_chunks(pkl)
+        failure_marker = os.getenv("USBGPU_BUILD_FAILURE_MARKER", "/tmp/openpilot_usbgpu_build_failure")
+        command = f'{base_command} --failure-marker {shlex.quote(failure_marker)}'
+        result = subprocess.run(command, shell=True, check=False)
+        if result.returncode != 0:
+          return result.returncode
+        chunk_action(target, source, env)
+      return 0
+    build_action = Action(do_usbgpu_build, "  [USBGPU] $TARGET")
+  else:
+    build_action = [compile_cmd, Action(do_chunk, "  [CHUNK] $TARGET")]
   node = lenv.Command(
     chunk_targets,
-    tinygrad_files + compile_modeld_script + driving_onnx_deps + [Value(chunk_targets), chunker_file],
-    [cmd, Action(do_chunk, "  [CHUNK] $TARGET")],
+    sources,
+    build_action,
   )
   if usbgpu:
     lenv.SideEffect(usbgpu_lock, node)
+    if USBGPU_FORCE_BUILD:
+      # The hardware retry must execute even if SCons sees an older cache as
+      # current. AlwaysBuild is intentionally not part of the node signature,
+      # so the next ordinary boot does not rebuild merely because force reset.
+      lenv.AlwaysBuild(node)
 
 # get model metadata
 fn = File(f"models/dmonitoring_model").abspath

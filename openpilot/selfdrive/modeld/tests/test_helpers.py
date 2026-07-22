@@ -328,3 +328,16 @@ def test_background_monitor_observes_bootstrap_reenumeration(tmp_path):
     monitor.stop()
 
   assert ready
+
+
+def test_ignition_lockout_is_atomically_replaced_and_cleared(tmp_path):
+  marker = tmp_path / "usbgpu-lockout"
+
+  helpers.set_usbgpu_ignition_lockout("first failure", marker)
+  assert helpers.usbgpu_ignition_lockout_reason(marker) == "first failure"
+  helpers.set_usbgpu_ignition_lockout("second failure", marker)
+  assert helpers.usbgpu_ignition_lockout_reason(marker) == "second failure"
+  assert list(tmp_path.iterdir()) == [marker]
+
+  helpers.clear_usbgpu_ignition_lockout(marker)
+  assert helpers.usbgpu_ignition_lockout_reason(marker) is None

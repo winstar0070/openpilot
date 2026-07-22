@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
+import fcntl
 import os
+from collections.abc import Callable
 from pathlib import Path
 import subprocess
 
 # NOTE: Do NOT import anything here that needs be built (e.g. params)
 from openpilot.common.basedir import BASEDIR
+from openpilot.common.file_chunker import (
+  cleanup_incomplete_file_chunks, cleanup_stale_file_chunk_temps, is_file_chunked_valid,
+)
 from openpilot.common.spinner import Spinner
 from openpilot.common.text_window import TextWindow
 from openpilot.common.hardware import HARDWARE, AGNOS
 
 
 USBGPU_BUILD_FAILURE_MARKER = os.getenv("USBGPU_BUILD_FAILURE_MARKER", "/tmp/openpilot_usbgpu_build_failure")
+USBGPU_MODEL_PATH = Path(BASEDIR) / "openpilot/selfdrive/modeld/models/big_driving_tinygrad.pkl"
+USBGPU_BUILD_LOCK = Path(BASEDIR) / "openpilot/selfdrive/modeld/models/.usb_gpu.lock"
 BUILD_PARALLELISM = ([], ["-j4"], ["-j1"])
 
 
@@ -29,27 +36,62 @@ def _read_failure_marker(marker_path: str) -> str | None:
   return reason or "USB GPU session lost"
 
 
-def run_build_attempts(run_attempt, marker_path: str = USBGPU_BUILD_FAILURE_MARKER) -> tuple[int, list[bytes], str | None]:
+def _attempt_failure_marker(marker_base: str, attempt: int) -> str:
+  return f"{marker_base}.{os.getpid()}.{attempt}"
+
+
+def _write_failure_marker_best_effort(marker_path: str, reason: str) -> None:
+  try:
+    Path(marker_path).write_text(reason.rstrip() + "\n")
+  except OSError:
+    pass
+
+
+def cleanup_usbgpu_build_temps(output: Path = USBGPU_MODEL_PATH, lock_path: Path = USBGPU_BUILD_LOCK) -> None:
+  lock_path.parent.mkdir(parents=True, exist_ok=True)
+  with lock_path.open("a+") as lock_file:
+    fcntl.flock(lock_file, fcntl.LOCK_EX)
+    cleanup_stale_file_chunk_temps(output)
+    cleanup_incomplete_file_chunks(output)
+
+
+def run_build_attempts(run_attempt, marker_path: str = USBGPU_BUILD_FAILURE_MARKER,
+                       artifact_valid: Callable[[], bool] | None = None) -> tuple[int, list[bytes], str | None, str]:
   """Run normal memory-pressure retries, plus one same-process-boundary USB GPU retry."""
   parallelism_index = 0
   hardware_retry_used = False
+  attempt = 0
   while parallelism_index < len(BUILD_PARALLELISM):
-    _clear_failure_marker(marker_path)
-    returncode, compile_output = run_attempt(BUILD_PARALLELISM[parallelism_index])
+    attempt += 1
+    attempt_marker = _attempt_failure_marker(marker_path, attempt)
+    _clear_failure_marker(attempt_marker)
+    returncode, compile_output = run_attempt(BUILD_PARALLELISM[parallelism_index], hardware_retry_used, attempt_marker)
     if returncode == 0:
-      _clear_failure_marker(marker_path)
-      return returncode, compile_output, None
+      if hardware_retry_used and artifact_valid is not None:
+        try:
+          valid = artifact_valid()
+          validation_error = None
+        except Exception as e:
+          valid = False
+          validation_error = f": {type(e).__name__}: {e}"
+        if not valid:
+          hardware_reason = "USB GPU retry exited successfully without a complete compiled model" + (validation_error or "")
+          _write_failure_marker_best_effort(attempt_marker, hardware_reason)
+          return 1, compile_output, hardware_reason, attempt_marker
+      _clear_failure_marker(attempt_marker)
+      return returncode, compile_output, None, attempt_marker
 
-    hardware_reason = _read_failure_marker(marker_path)
+    hardware_reason = _read_failure_marker(attempt_marker)
     if hardware_reason is not None:
       if hardware_retry_used:
-        return returncode, compile_output, hardware_reason
+        return returncode, compile_output, hardware_reason, attempt_marker
       hardware_retry_used = True
+      _clear_failure_marker(attempt_marker)
       continue
 
     parallelism_index += 1
 
-  return returncode, compile_output, None
+  return returncode, compile_output, None, attempt_marker
 
 
 def format_build_error(compile_output: list[bytes], hardware_reason: str | None,
@@ -70,9 +112,16 @@ def build() -> None:
   if AGNOS:
     os.sched_setaffinity(0, range(8))  # ensure we can use the isolcpus cores
 
-  def run_attempt(parallelism: list[str]) -> tuple[int, list[bytes]]:
+  def run_attempt(parallelism: list[str], force_usbgpu: bool, marker_path: str) -> tuple[int, list[bytes]]:
     compile_output: list[bytes] = []
-    build_env = {**os.environ, "PWD": BASEDIR, "USBGPU_BUILD_FAILURE_MARKER": USBGPU_BUILD_FAILURE_MARKER}
+    cleanup_usbgpu_build_temps()
+    build_env = {
+      **os.environ,
+      "PWD": BASEDIR,
+      "USBGPU_BUILD_FAILURE_MARKER": marker_path,
+      "USBGPU_BUILD_LOCK": str(USBGPU_BUILD_LOCK),
+      "USBGPU_FORCE_BUILD": "1" if force_usbgpu else "0",
+    }
     with subprocess.Popen(["scons", *parallelism], cwd=BASEDIR, env=build_env, stderr=subprocess.PIPE) as scons:
       assert scons.stderr is not None
 
@@ -103,11 +152,14 @@ def build() -> None:
 
   # Building with all cores can use too much memory. Hardware session loss gets one
   # fresh SCons/Python process at the same parallelism instead of memory retries.
-  returncode, compile_output, hardware_reason = run_build_attempts(run_attempt)
+  returncode, compile_output, hardware_reason, marker_path = run_build_attempts(
+    run_attempt,
+    artifact_valid=lambda: is_file_chunked_valid(USBGPU_MODEL_PATH, require_manifest=True),
+  )
 
   if returncode != 0:
     # Build failed log errors
-    error_s = format_build_error(compile_output, hardware_reason)
+    error_s = format_build_error(compile_output, hardware_reason, marker_path)
 
     # Show TextWindow
     spinner.close()

@@ -20,8 +20,28 @@ from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_I
 from openpilot.common.swaglog import cloudlog, add_file_handler
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware.hw import Paths
+from openpilot.selfdrive.modeld.helpers import clear_usbgpu_ignition_lockout
 
 from openpilot.sunnypilot.system.params_migration import run_migration
+
+
+def update_usbgpu_ignition_lockout(started: bool, last_valid_started: bool | None,
+                                   sample_updated: bool = True, sample_valid: bool = True,
+                                   sample_alive: bool = True, ignition: bool = False,
+                                   ignition_known: bool = True) -> bool | None:
+  """Track and act only on real deviceState samples, independently of manager state."""
+  if not (sample_updated and sample_valid and sample_alive):
+    return last_valid_started
+  # hardwared can briefly publish a valid default offroad state while manager
+  # restarts onroad. Defer offroad acceptance until panda confirms ignition off.
+  if not started and (not ignition_known or ignition):
+    return last_valid_started
+  if not started:
+    try:
+      clear_usbgpu_ignition_lockout()
+    except OSError:
+      cloudlog.exception("Failed to clear USB GPU ignition lockout")
+  return started
 
 
 def manager_init() -> None:
@@ -142,19 +162,28 @@ def manager_thread() -> None:
   ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore)
 
   started_prev = False
+  usbgpu_last_valid_started = None
   ignition_prev = False
 
   while True:
     sm.update(1000)
 
     started = sm['deviceState'].started
+    known_panda_states = [ps for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown]
+    ignition_known = sm.valid['pandaStates'] and sm.alive['pandaStates'] and bool(known_panda_states)
+    ignition = any(ps.ignitionLine or ps.ignitionCan for ps in known_panda_states)
+
+    usbgpu_last_valid_started = update_usbgpu_ignition_lockout(
+      started, usbgpu_last_valid_started,
+      sm.updated['deviceState'], sm.valid['deviceState'], sm.alive['deviceState'],
+      ignition, ignition_known,
+    )
 
     if started and not started_prev:
       params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
     elif not started and started_prev:
       params.clear_all(ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
 
-    ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
     if ignition and not ignition_prev:
       params.clear_all(ParamKeyFlag.CLEAR_ON_IGNITION_ON)
 

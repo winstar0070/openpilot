@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import pickle
 import shutil
 import struct
@@ -18,8 +19,41 @@ USBGPU_LINK_ERROR_THRESHOLD = 5.0
 USBGPU_LINK_ERROR_COUNTER_MASK = 0xFFFF
 USBGPU_LINK_SAMPLE_SECONDS = 2.0
 USBGPU_LINK_MIN_GAP_TOLERANCE = 0.5
+USBGPU_IGNITION_LOCKOUT_PATH = Path("/tmp/openpilot_usbgpu_ignition_lockout")
 
 UsbGpuReadyIdentity = tuple[str, int, int, int]
+
+
+def usbgpu_ignition_lockout_reason(path: Path | None = None) -> str | None:
+  marker = path or USBGPU_IGNITION_LOCKOUT_PATH
+  try:
+    return marker.read_text().strip() or "USB GPU session failed earlier in this ignition"
+  except FileNotFoundError:
+    return None
+  except OSError as e:
+    # An unreadable existing marker must fail closed for the current ignition.
+    return f"USB GPU ignition lockout marker unreadable: {e}"
+
+
+def set_usbgpu_ignition_lockout(reason: str, path: Path | None = None) -> None:
+  marker = path or USBGPU_IGNITION_LOCKOUT_PATH
+  marker.parent.mkdir(parents=True, exist_ok=True)
+  tmp_path = None
+  try:
+    with tempfile.NamedTemporaryFile("w", dir=marker.parent, prefix=f".{marker.name}.", delete=False) as f:
+      tmp_path = Path(f.name)
+      f.write(reason.rstrip() + "\n")
+    os.replace(tmp_path, marker)
+  finally:
+    if tmp_path is not None:
+      tmp_path.unlink(missing_ok=True)
+
+
+def clear_usbgpu_ignition_lockout(path: Path | None = None) -> None:
+  try:
+    (path or USBGPU_IGNITION_LOCKOUT_PATH).unlink()
+  except FileNotFoundError:
+    pass
 
 
 def get_tg_input_devices(process_name: str, usbgpu: bool):
@@ -216,6 +250,20 @@ class UsbGpuLinkMonitor:
         return True, None
       rate = self._link_error_rate_locked(now)
       return rate is not None and rate <= USBGPU_LINK_ERROR_THRESHOLD, rate
+
+  def current_identity(self) -> UsbGpuReadyIdentity | None:
+    with self._lock:
+      return self._identity
+
+  def reset_stability(self) -> None:
+    """Start a fresh post-init window without touching the USB device."""
+    with self._sample_lock, self._lock:
+      if self._identity is None:
+        self._reset_locked()
+        return
+      now = time.monotonic()
+      self._stable_since = now
+      self._link_samples = [(now, self._link_samples[-1][1])] if self._link_samples else []
 
   def _run(self):
     while not self._stop_event.wait(self.poll_interval):

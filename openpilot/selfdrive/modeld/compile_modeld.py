@@ -6,6 +6,7 @@ import math
 import os
 import pickle
 from pathlib import Path
+import sys
 import tempfile
 import time
 import shutil
@@ -335,10 +336,18 @@ def cleanup_compile_outputs(output: str) -> None:
 def write_failure_marker(path: str, reason: str) -> None:
   marker = Path(path)
   marker.parent.mkdir(parents=True, exist_ok=True)
-  with tempfile.NamedTemporaryFile("w", dir=marker.parent, prefix=f".{marker.name}.", delete=False) as f:
-    tmp_path = f.name
-    f.write(reason.rstrip() + "\n")
-  os.replace(tmp_path, marker)
+  tmp_path = None
+  try:
+    with tempfile.NamedTemporaryFile("w", dir=marker.parent, prefix=f".{marker.name}.", delete=False) as f:
+      tmp_path = f.name
+      f.write(reason.rstrip() + "\n")
+    os.replace(tmp_path, marker)
+  finally:
+    if tmp_path is not None:
+      try:
+        os.unlink(tmp_path)
+      except FileNotFoundError:
+        pass
 
 
 def dump_oob_atomic(obj, output: str) -> None:
@@ -359,9 +368,14 @@ def dump_oob_atomic(obj, output: str) -> None:
 
 
 def handle_compile_failure(output: str, failure_marker: str | None, exc: BaseException) -> None:
-  if failure_marker and (reason := usbgpu_session_failure_reason(exc)) is not None:
-    write_failure_marker(failure_marker, reason)
   cleanup_compile_outputs(output)
+  if failure_marker and (reason := usbgpu_session_failure_reason(exc)) is not None:
+    try:
+      write_failure_marker(failure_marker, reason)
+    except Exception as marker_error:
+      # Marker transport must never replace the hardware exception or prevent
+      # output cleanup. The original exception is re-raised by main.
+      print(f"Failed to write USB GPU failure marker {failure_marker}: {marker_error}", file=sys.stderr)
 
 
 def main() -> None:

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+import gc
 import json
 import os
 os.environ['GMMU'] = '0' # for usbgpu fast loading, noop for qcom
 from tinygrad.tensor import Tensor
+import threading
 import time
+import traceback
 import numpy as np
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
@@ -21,12 +24,13 @@ from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
-from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, WARP_INPUTS, POLICY_INPUTS
+from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, usbgpu_session_failure_reason, WARP_INPUTS, POLICY_INPUTS
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
-from openpilot.common.file_chunker import open_file_chunked, get_manifest_path
+from openpilot.common.file_chunker import is_file_chunked_valid, open_file_chunked
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.egpu_diagnostics import collect_egpu_diagnostics
 from openpilot.selfdrive.modeld.helpers import UsbGpuLinkMonitor
+from openpilot.selfdrive.modeld.helpers import set_usbgpu_ignition_lockout, usbgpu_ignition_lockout_reason
 from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_speed, usbgpu_superspeed_ready, wait_for_usbgpu_present, wait_for_usbgpu_ready
 from openpilot.selfdrive.modeld.helpers import modeld_pkl_path, get_tg_input_devices, load_oob
 
@@ -73,10 +77,10 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
                                 shouldStop=bool(should_stop))
 
 
-def log_egpu_diagnostics(error: BaseException):
+def log_egpu_diagnostics(error: BaseException, traceback_text: str | None = None):
   diagnostic_path = None
   try:
-    diagnostic_path, diagnostics = collect_egpu_diagnostics(error)
+    diagnostic_path, diagnostics = collect_egpu_diagnostics(error, traceback_text=traceback_text)
     diagnostic_summary = {
       "path": str(diagnostic_path) if diagnostic_path is not None else None,
       "egpuDevices": diagnostics.get("egpuDevices", []),
@@ -89,6 +93,14 @@ def log_egpu_diagnostics(error: BaseException):
   except Exception:
     cloudlog.exception("USB GPU diagnostic collection failed")
   return diagnostic_path
+
+
+def usbgpu_model_compiled() -> bool:
+  return is_file_chunked_valid(modeld_pkl_path(usbgpu=True), require_manifest=True)
+
+
+def usbgpu_speed_eligible(speed: int | None) -> bool:
+  return speed == 12 or (speed is not None and speed >= 5000)
 
 
 def _opened_usbgpu_device(model=None):
@@ -117,61 +129,112 @@ def configure_usbgpu_runtime(model):
     raise
 
 
-def record_usbgpu_failure(params: Params, error: str):
+def record_usbgpu_failure(params: Params, error: str, ignition_lockout: bool = True):
   params.put_bool("UsbGpuPresent", usbgpu_present())
   params.put_bool("UsbGpuReady", False)
   params.put("UsbGpuInitError", error)
+  if ignition_lockout:
+    try:
+      set_usbgpu_ignition_lockout(error)
+    except OSError:
+      cloudlog.exception("Failed to persist USB GPU ignition lockout")
 
 
-def switch_to_qcom(model, cam_w: int, cam_h: int, error: Exception | None = None, mark_lost: bool = True):
-  lat_delay = getattr(model, "lat_delay", None)
+def _capture_qcom_fallback_state(model) -> dict[str, object]:
+  state: dict[str, object] = {"lat_delay": getattr(model, "lat_delay", None)}
+  # Both values are host numpy mirrors. Never inspect Tensor queues or device
+  # buffers after the USB session has been poisoned.
+  if isinstance(prev_desire := getattr(model, "prev_desire", None), np.ndarray):
+    state["prev_desire"] = prev_desire.copy()
+  npy = getattr(model, "npy", None)
+  if isinstance(npy, dict) and isinstance(prev_feat := npy.get("prev_feat"), np.ndarray):
+    state["prev_feat"] = prev_feat.copy()
+  return state
+
+
+def _restore_qcom_fallback_state(model, state: dict[str, object]) -> None:
+  if (lat_delay := state.get("lat_delay")) is not None:
+    model.lat_delay = lat_delay
+  npy = getattr(model, "npy", None)
+  for name in ("prev_desire", "prev_feat"):
+    destination = getattr(model, name, None) if name == "prev_desire" else npy.get(name) if isinstance(npy, dict) else None
+    source = state.get(name)
+    if isinstance(destination, np.ndarray) and isinstance(source, np.ndarray) and destination.shape == source.shape:
+      destination[:] = source
+
+
+def _format_usbgpu_failure(error: BaseException, failure_class: str | None = None) -> str:
+  hardware_reason = usbgpu_session_failure_reason(error)
+  if hardware_reason is None and "wait timeout" in str(error).lower():
+    hardware_reason = f"{type(error).__name__}: {error}"
+  classification = failure_class or ("hardware" if hardware_reason is not None else "unknown")
+  detail = hardware_reason or f"{type(error).__name__}: {error}"
+  return f"{classification}: {detail}"
+
+
+def _clear_exception_tracebacks(error: BaseException) -> None:
+  seen: set[int] = set()
+  current: BaseException | None = error
+  while current is not None and id(current) not in seen:
+    seen.add(id(current))
+    current.__traceback__ = None
+    current = current.__cause__ or current.__context__
+
+
+def prepare_usbgpu_fallback(model, params: Params, error: Exception,
+                            failure_class: str | None = None,
+                            fallback_state: dict[str, object] | None = None) -> tuple[dict[str, object], str]:
+  state = fallback_state if fallback_state is not None else _capture_qcom_fallback_state(model)
+  mark_usbgpu_device_lost(model, error)
+  reason = _format_usbgpu_failure(error, failure_class)
+  record_usbgpu_failure(params, reason)
+  return state, reason
+
+
+def switch_to_qcom(model, cam_w: int, cam_h: int, error: Exception | None = None, mark_lost: bool = True,
+                   fallback_state: dict[str, object] | None = None):
+  state = fallback_state if fallback_state is not None else _capture_qcom_fallback_state(model)
   if mark_lost:
     mark_usbgpu_device_lost(model, error)
   replacement = ModelState(cam_w, cam_h, usbgpu=False)
-  if lat_delay is not None:
-    replacement.lat_delay = lat_delay
+  _restore_qcom_fallback_state(replacement, state)
   return replacement
 
 
-def fail_over_usbgpu(model, cam_w: int, cam_h: int, params: Params, error: Exception):
-  """Poison AMD and publish fallback state before any slow diagnostics."""
-  mark_usbgpu_device_lost(model, error)
-  reason = f"{type(error).__name__}: {error}"
-  record_usbgpu_failure(params, reason)
-  return switch_to_qcom(model, cam_w, cam_h, error, mark_lost=False), reason
+def schedule_egpu_diagnostics(failure_reason: str, traceback_text: str | None = None) -> None:
+  """Collect slow diagnostics after QCOM has produced its first fresh output."""
+  def collect() -> None:
+    log_egpu_diagnostics(RuntimeError(failure_reason), traceback_text)
+
+  threading.Thread(target=collect, name="egpu-diagnostics", daemon=True).start()
 
 
 def finish_usbgpu_startup(model, cam_w: int, cam_h: int, params: Params, link_monitor: UsbGpuLinkMonitor | None = None):
   if link_monitor is not None:
-    link_monitor.sample(blocking=False)
-    link_validated_during_load, link_rate = link_monitor.status(USBGPU_STABLE_DURATION)
-  else:
-    link_validated_during_load, link_rate = False, None
-  if link_validated_during_load:
-    if link_rate is None:
-      cloudlog.warning("USB GPU identity remained stable during model load")
-    else:
-      cloudlog.warning(f"USB GPU link validated during model load at {link_rate:.1f} errors/s")
-  elif link_rate is not None:
-    cloudlog.warning(f"USB GPU link accumulated {link_rate:.1f} errors/s during model load; waiting for stability")
+    link_monitor.sample()
+    # Ready is post-init health, so model loading can never consume this window.
+    link_monitor.reset_stability()
 
-  if not link_validated_during_load and not wait_for_usbgpu_ready(USBGPU_READY_TIMEOUT, stable_duration=USBGPU_STABLE_DURATION,
-                                                                  monitor=link_monitor):
+  if not wait_for_usbgpu_ready(USBGPU_READY_TIMEOUT, stable_duration=USBGPU_STABLE_DURATION, monitor=link_monitor):
     error = "AMD probe succeeded but USB device did not remain configured at SuperSpeed"
     cloudlog.error("USB GPU probe succeeded without stable configured SuperSpeed readiness; falling back to QCOM")
-    replacement, _ = fail_over_usbgpu(model, cam_w, cam_h, params, RuntimeError(error))
-    return replacement, False
+    fallback_state, reason = prepare_usbgpu_fallback(model, params, RuntimeError(error), "hardware")
+    model = None
+    return False, fallback_state, reason, None
 
   try:
     configure_usbgpu_runtime(model)
   except Exception as e:
+    traceback_text = "".join(traceback.format_exception(e))
     error = f"Failed to configure AMD runtime: {type(e).__name__}: {e}"
-    replacement, _ = fail_over_usbgpu(model, cam_w, cam_h, params, RuntimeError(error))
-    return replacement, False
+    fallback_state, reason = prepare_usbgpu_fallback(model, params, RuntimeError(error), "initialization")
+    _clear_exception_tracebacks(e)
+    model = None
+    return False, fallback_state, reason, traceback_text
   params.put_bool("UsbGpuPresent", usbgpu_present())
   params.put_bool("UsbGpuReady", True)
   params.remove("UsbGpuInitError")
-  return model, True
+  return True, None, None, None
 
 
 class FrameMeta:
@@ -250,28 +313,40 @@ class ModelState(ModelStateBase):
 def main(demo=False):
   cloudlog.warning("modeld init")
 
-  _compiled = os.path.isfile(get_manifest_path(modeld_pkl_path(usbgpu=True)))
+  params = Params()
+  ignition_lockout = usbgpu_ignition_lockout_reason()
+  _compiled = usbgpu_model_compiled()
   detection_started = time.monotonic()
   _present = usbgpu_present()
-  if _compiled and not _present:
+  if _compiled and not _present and ignition_lockout is None:
     cloudlog.warning(f"USB GPU model compiled; waiting up to {USBGPU_ATTACH_TIMEOUT:.1f}s for ignition-time attachment")
     _present = wait_for_usbgpu_present(USBGPU_ATTACH_TIMEOUT)
   detection_time = time.monotonic() - detection_started
   _speed = usbgpu_speed() if _present else None
-  USBGPU = _present and _compiled
-  params = Params()
+  _speed_eligible = usbgpu_speed_eligible(_speed)
+  USBGPU = _present and _compiled and _speed_eligible and ignition_lockout is None
   params.put_bool("UsbGpuPresent", _present)
   params.put_bool("UsbGpuCompiled", _compiled)
   # Ready means model initialization succeeded and the configured SuperSpeed link stayed stable.
   params.put_bool("UsbGpuReady", False)
-  params.remove("UsbGpuInitError")
-  if USBGPU:
-    device_kind = 'SuperSpeed' if usbgpu_superspeed_ready() else 'bootstrap'
-    cloudlog.warning(f"USB GPU detected after {detection_time:.1f}s at {_speed}M; initializing {device_kind} device")
-  elif _compiled:
-    error = f"USB GPU not detected within {USBGPU_ATTACH_TIMEOUT:.1f}s; falling back to QCOM"
+  if ignition_lockout is not None:
+    error = f"USB GPU disabled for current ignition after prior failure: {ignition_lockout}"
     params.put("UsbGpuInitError", error)
     cloudlog.error(error)
+  elif USBGPU:
+    params.remove("UsbGpuInitError")
+    device_kind = 'SuperSpeed' if usbgpu_superspeed_ready() else 'bootstrap'
+    cloudlog.warning(f"USB GPU detected after {detection_time:.1f}s at {_speed}M; initializing {device_kind} device")
+  elif _compiled and _present:
+    error = f"USB GPU detected at unsupported {_speed}M link speed; expected bootstrap 12M or SuperSpeed; falling back to QCOM"
+    record_usbgpu_failure(params, error)
+    cloudlog.error(error)
+  elif _compiled:
+    error = f"USB GPU not detected within {USBGPU_ATTACH_TIMEOUT:.1f}s; falling back to QCOM"
+    record_usbgpu_failure(params, error)
+    cloudlog.error(error)
+  else:
+    params.remove("UsbGpuInitError")
 
   # Start before realtime configuration so the polling thread stays low priority.
   # Its observation window overlaps camera setup and model loading.
@@ -306,6 +381,7 @@ def main(demo=False):
 
   st = time.monotonic()
   cloudlog.warning("loading model")
+  pending_egpu_diagnostic: tuple[str, str | None] | None = None
   try:
     model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
   except Exception as e:
@@ -313,17 +389,29 @@ def main(demo=False):
       raise
 
     USBGPU = False
-    model, failure_reason = fail_over_usbgpu(None, vipc_client_main.width, vipc_client_main.height, params, e)
-    diagnostic_path = log_egpu_diagnostics(e)
-    record_usbgpu_failure(params, f"{failure_reason}; diagnostics={diagnostic_path}")
+    failure_traceback = "".join(traceback.format_exception(e))
     cloudlog.exception("USB GPU model initialization failed, falling back to QCOM")
+    fallback_state, failure_reason = prepare_usbgpu_fallback(None, params, e, "initialization")
+    _clear_exception_tracebacks(e)
+    gc.collect()
+    model = switch_to_qcom(None, vipc_client_main.width, vipc_client_main.height, mark_lost=False, fallback_state=fallback_state)
+    pending_egpu_diagnostic = (failure_reason, failure_traceback)
   finally:
     if link_monitor is not None:
       link_monitor.stop()
   model_load_time = time.monotonic() - st
   link_validation_started = time.monotonic()
   if USBGPU:
-    model, USBGPU = finish_usbgpu_startup(model, vipc_client_main.width, vipc_client_main.height, params, link_monitor)
+    USBGPU, startup_fallback_state, startup_failure, startup_traceback = finish_usbgpu_startup(
+      model, vipc_client_main.width, vipc_client_main.height, params, link_monitor,
+    )
+    if not USBGPU:
+      assert startup_fallback_state is not None and startup_failure is not None
+      model = None
+      gc.collect()
+      model = switch_to_qcom(None, vipc_client_main.width, vipc_client_main.height,
+                             mark_lost=False, fallback_state=startup_fallback_state)
+      pending_egpu_diagnostic = (startup_failure, startup_traceback)
   link_validation_time = time.monotonic() - link_validation_started
   cloudlog.warning(f"models loaded in {model_load_time:.1f}s, USB GPU validation in {link_validation_time:.1f}s, modeld starting")
 
@@ -438,6 +526,9 @@ def main(demo=False):
       'action_t': np.array([lat_action_t, long_action_t], dtype=np.float32),
     }
 
+    # Preserve only host mirrors from the last successful frame. A failed AMD
+    # call may mutate these before poisoning the USB session.
+    usbgpu_fallback_state = _capture_qcom_fallback_state(model) if USBGPU else None
     mt1 = time.perf_counter()
     try:
       model_output = model.run(bufs, transforms, inputs)
@@ -446,13 +537,16 @@ def main(demo=False):
         raise
 
       USBGPU = False
-      model, failure_reason = fail_over_usbgpu(model, vipc_client_main.width, vipc_client_main.height, params, e)
-      diagnostic_path = log_egpu_diagnostics(e)
-      record_usbgpu_failure(params, f"{failure_reason}; diagnostics={diagnostic_path}")
+      failure_traceback = "".join(traceback.format_exception(e))
       cloudlog.exception("USB GPU model execution failed, falling back to QCOM")
-      bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
-      transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
-      model_output = model.run(bufs, transforms, inputs)
+      fallback_state, failure_reason = prepare_usbgpu_fallback(model, params, e, fallback_state=usbgpu_fallback_state)
+      _clear_exception_tracebacks(e)
+      model = None
+      gc.collect()
+      model = switch_to_qcom(None, vipc_client_main.width, vipc_client_main.height, mark_lost=False, fallback_state=fallback_state)
+      pending_egpu_diagnostic = (failure_reason, failure_traceback)
+      # Never replay a failed AMD frame or its mutated inputs in the new QCOM session.
+      continue
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
@@ -483,6 +577,9 @@ def main(demo=False):
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
       pm.send('modelDataV2SP', mdv2sp_send)
+      if pending_egpu_diagnostic is not None:
+        schedule_egpu_diagnostics(*pending_egpu_diagnostic)
+        pending_egpu_diagnostic = None
     last_vipc_frame_id = meta_main.frame_id
 
 

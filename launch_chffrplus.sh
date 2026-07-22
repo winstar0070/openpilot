@@ -56,24 +56,64 @@ function usbgpu_speed {
   echo "$usbgpu_speed_value"
 }
 
+function usbgpu_identity {
+  local usbgpu_expected_speed="$1"
+  local usbgpu_device usbgpu_device_speed usbgpu_configuration usbgpu_devnum
+  for usbgpu_device in "$USBGPU_USB_SYSFS_ROOT"/*; do
+    [ -f "$usbgpu_device/idVendor" ] || continue
+    [ -f "$usbgpu_device/idProduct" ] || continue
+    [ "$(< "$usbgpu_device/idVendor")" = "add1" ] || continue
+    [ "$(< "$usbgpu_device/idProduct")" = "0001" ] || continue
+    [ -f "$usbgpu_device/speed" ] || continue
+    [ -f "$usbgpu_device/bConfigurationValue" ] || continue
+    [ -f "$usbgpu_device/devnum" ] || continue
+    usbgpu_device_speed="$(< "$usbgpu_device/speed")"
+    usbgpu_device_speed="${usbgpu_device_speed%%.*}"
+    usbgpu_configuration="$(< "$usbgpu_device/bConfigurationValue")"
+    usbgpu_devnum="$(< "$usbgpu_device/devnum")"
+    if [ "$usbgpu_device_speed" -eq "$usbgpu_expected_speed" ] 2>/dev/null && \
+       [ "$usbgpu_device_speed" -ge 5000 ] 2>/dev/null && \
+       [ "$usbgpu_configuration" -gt 0 ] 2>/dev/null && \
+       [ "$usbgpu_devnum" -gt 0 ] 2>/dev/null; then
+      printf '%s|%s|%s|%s\n' "$usbgpu_device" "$usbgpu_devnum" "$usbgpu_device_speed" "$usbgpu_configuration"
+      return 0
+    fi
+  done
+  return 1
+}
+
 function wait_for_usbgpu_stable {
   local usbgpu_timeout="$1"
   local usbgpu_break_on_low_speed="$2"
-  local usbgpu_current_speed usbgpu_elapsed usbgpu_stable_seconds=0 usbgpu_slow_seconds=0
+  local usbgpu_current_speed usbgpu_current_identity usbgpu_stable_identity=""
+  local usbgpu_elapsed usbgpu_stable_seconds=0 usbgpu_slow_seconds=0
 
   for ((usbgpu_elapsed = 0; usbgpu_elapsed < usbgpu_timeout; usbgpu_elapsed++)); do
     usbgpu_current_speed="$(usbgpu_speed)"
-    if [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
-      usbgpu_stable_seconds=$((usbgpu_stable_seconds + 1))
+    if [ "$usbgpu_current_speed" -eq 12 ] 2>/dev/null; then
+      return 2
+    elif [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
+      usbgpu_current_identity="$(usbgpu_identity "$usbgpu_current_speed")"
+      if [ -n "$usbgpu_current_identity" ] && [ "$usbgpu_current_identity" = "$usbgpu_stable_identity" ]; then
+        usbgpu_stable_seconds=$((usbgpu_stable_seconds + 1))
+      elif [ -n "$usbgpu_current_identity" ]; then
+        usbgpu_stable_identity="$usbgpu_current_identity"
+        usbgpu_stable_seconds=0
+      else
+        usbgpu_stable_identity=""
+        usbgpu_stable_seconds=0
+      fi
       usbgpu_slow_seconds=0
       [ "$usbgpu_stable_seconds" -ge "$USBGPU_STABLE_SECONDS" ] && return 0
     elif [ "$usbgpu_current_speed" -gt 0 ] 2>/dev/null; then
+      usbgpu_stable_identity=""
       usbgpu_stable_seconds=0
       usbgpu_slow_seconds=$((usbgpu_slow_seconds + 1))
       if [ "$usbgpu_break_on_low_speed" = "1" ] && [ "$usbgpu_slow_seconds" -ge "$USBGPU_LOW_SPEED_GRACE_SEC" ]; then
         return 1
       fi
     else
+      usbgpu_stable_identity=""
       usbgpu_stable_seconds=0
       usbgpu_slow_seconds=0
     fi
@@ -85,7 +125,7 @@ function wait_for_usbgpu_stable {
 function prepare_usbgpu {
   local usbgpu_xhci_device="xhci-hcd.1.auto"
   local usbgpu_xhci_path="$USBGPU_PLATFORM_SYSFS_ROOT/$usbgpu_xhci_device"
-  local usbgpu_xhci_driver usbgpu_current_speed
+  local usbgpu_xhci_driver usbgpu_current_speed usbgpu_stability_status
   local usbgpu_attempt usbgpu_waited
 
   [ -L "$usbgpu_xhci_path/driver" ] || return
@@ -114,8 +154,13 @@ function prepare_usbgpu {
   fi
 
   if [ "$usbgpu_current_speed" -ge 5000 ] 2>/dev/null; then
-    if wait_for_usbgpu_stable "$USBGPU_INITIAL_STABILITY_TIMEOUT_SEC" 0; then
+    wait_for_usbgpu_stable "$USBGPU_INITIAL_STABILITY_TIMEOUT_SEC" 0
+    usbgpu_stability_status=$?
+    if [ "$usbgpu_stability_status" -eq 0 ]; then
       echo "USB GPU ready at ${usbgpu_current_speed}M"
+      return
+    elif [ "$usbgpu_stability_status" -eq 2 ]; then
+      echo "USB GPU bootstrap device detected during stability check; handing off to tinygrad"
       return
     fi
     echo "USB GPU SuperSpeed link was not stable; resetting controller"
@@ -135,9 +180,14 @@ function prepare_usbgpu {
     fi
 
     # Require eight continuous seconds at SuperSpeed after controller recovery.
-    if wait_for_usbgpu_stable "$USBGPU_RECOVERY_TIMEOUT_SEC" 1; then
+    wait_for_usbgpu_stable "$USBGPU_RECOVERY_TIMEOUT_SEC" 1
+    usbgpu_stability_status=$?
+    if [ "$usbgpu_stability_status" -eq 0 ]; then
       usbgpu_current_speed="$(usbgpu_speed)"
       echo "USB GPU ready at ${usbgpu_current_speed}M"
+      return
+    elif [ "$usbgpu_stability_status" -eq 2 ]; then
+      echo "USB GPU bootstrap device detected after controller recovery; handing off to tinygrad"
       return
     fi
 
