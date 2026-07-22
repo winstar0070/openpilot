@@ -24,6 +24,17 @@ from openpilot.common.hardware.hw import Paths
 from openpilot.sunnypilot.system.params_migration import run_migration
 
 
+def should_clear_usbgpu_init_error(device_state_started: bool, device_state_valid: bool,
+                                   panda_states, panda_states_valid: bool, panda_states_alive: bool) -> bool:
+  if device_state_started or not device_state_valid or not panda_states_valid or not panda_states_alive or not panda_states:
+    return False
+
+  if any(ps.pandaType == log.PandaState.PandaType.unknown for ps in panda_states):
+    return False
+
+  return not any(ps.ignitionLine or ps.ignitionCan for ps in panda_states)
+
+
 def manager_init() -> None:
   save_bootlog()
 
@@ -157,6 +168,12 @@ def manager_thread() -> None:
     ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
     if ignition and not ignition_prev:
       params.clear_all(ParamKeyFlag.CLEAR_ON_IGNITION_ON)
+
+    if params.get("UsbGpuInitError") is not None and should_clear_usbgpu_init_error(
+      started, sm.valid['deviceState'], sm['pandaStates'], sm.valid['pandaStates'], sm.alive['pandaStates'],
+    ):
+      params.remove("UsbGpuInitError")
+      cloudlog.info("USB GPU initialization lockout cleared after confirmed ignition off")
 
     # update offroad state for services that don't subscribe to deviceState
     if started != started_prev:
