@@ -30,7 +30,8 @@ from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_drivi
 from openpilot.common.file_chunker import open_file_chunked, get_manifest_path
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.egpu_diagnostics import collect_egpu_diagnostics
-from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_speed, wait_for_usbgpu_present, wait_for_usbgpu_ready
+from openpilot.selfdrive.modeld.helpers import USBGPU_SUPERSPEED_MBIT, usbgpu_present, usbgpu_speed, usbgpu_speed_eligible
+from openpilot.selfdrive.modeld.helpers import wait_for_usbgpu_present, wait_for_usbgpu_ready
 from openpilot.selfdrive.modeld.helpers import modeld_pkl_path, get_tg_input_devices, load_oob
 
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
@@ -73,10 +74,6 @@ def log_egpu_diagnostics(error: BaseException, traceback_text: str | None = None
 
 def usbgpu_model_compiled() -> bool:
   return os.path.isfile(get_manifest_path(modeld_pkl_path(usbgpu=True)))
-
-
-def usbgpu_speed_eligible(speed: int | None) -> bool:
-  return speed == 12 or (speed is not None and speed >= 5000)
 
 
 def _exception_chain(error: BaseException):
@@ -154,7 +151,7 @@ def select_usbgpu(params: Params) -> tuple[bool, str | None]:
     cloudlog.error(f"USB GPU disabled for current onroad manager cycle after prior failure: {prior_error}")
   elif use_usbgpu:
     params.remove("UsbGpuInitError")
-    device_kind = "SuperSpeed" if speed is not None and speed >= 5000 else "bootstrap"
+    device_kind = "SuperSpeed" if speed == USBGPU_SUPERSPEED_MBIT else "bootstrap"
     cloudlog.warning(f"USB GPU detected after {detection_time:.1f}s at {speed}M; initializing {device_kind} device")
   elif compiled and present:
     error = f"USB GPU detected at unsupported {speed}M link speed; expected bootstrap 12M or SuperSpeed"
