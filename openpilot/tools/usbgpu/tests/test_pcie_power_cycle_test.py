@@ -11,19 +11,19 @@ from openpilot.tools.usbgpu import pcie_power_cycle_test as power_cycle
 DEVICE = "usb:4-10"
 
 
-def write_usb_state(root, *, speed=5000, configuration=1, devnum=10):
-  path = root / "4-1"
+def write_usb_state(root, *, name="4-1", busnum=4, speed=5000, configuration=1, devnum=10):
+  path = root / name
   path.mkdir(parents=True, exist_ok=True)
   fields = {
     "idVendor": "add1",
     "idProduct": "0001",
-    "busnum": "4",
+    "busnum": str(busnum),
     "devnum": str(devnum),
     "speed": str(speed),
     "bConfigurationValue": str(configuration),
   }
-  for name, value in fields.items():
-    (path / name).write_text(f"{value}\n")
+  for field_name, value in fields.items():
+    (path / field_name).write_text(f"{value}\n")
   return path
 
 
@@ -88,6 +88,16 @@ def test_lifecycle_requires_fresh_offroad_stopped_and_ignition_off(monkeypatch):
   install_lifecycle_modules(monkeypatch, ignition=True)
   with pytest.raises(power_cycle.PowerCycleSafetyError, match="ignition on"):
     power_cycle.check_offroad_ignition_off()
+
+
+def test_device_is_auto_detected_only_when_unambiguous(tmp_path):
+  sysfs_root = tmp_path / "sysfs"
+  write_usb_state(sysfs_root, devnum=10)
+  assert power_cycle._detect_device(sysfs_root) == "usb:4-10"
+
+  write_usb_state(sysfs_root, name="4-2", devnum=11)
+  with pytest.raises(power_cycle.PowerCycleSafetyError, match="found 2"):
+    power_cycle._detect_device(sysfs_root)
 
 
 def test_power_cycle_logs_off_on_and_stable_same_path(monkeypatch, tmp_path):

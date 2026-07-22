@@ -10,7 +10,7 @@ Check all gates without sending F3:
 ```sh
 cd /data/openpilot
 python3 openpilot/tools/usbgpu/pcie_power_cycle_test.py \
-  --device usb:4-10 --dry-run
+  --dry-run
 ```
 
 Run one 500 ms F3 off/on cycle:
@@ -18,11 +18,13 @@ Run one 500 ms F3 off/on cycle:
 ```sh
 cd /data/openpilot
 python3 openpilot/tools/usbgpu/pcie_power_cycle_test.py \
-  --device usb:4-10 --confirm-risk
+  --confirm-risk
 ```
 
-Replace `usb:4-10` with the device's current bus and device address. A failed ON
-may leave the GPU off until external power is cycled, so keep physical power
+The tool automatically detects the `ADD1:0001` device when exactly one is
+present. If multiple matching devices exist, it refuses to choose; pass an
+explicit identity such as `--device usb:4-10`. A failed ON may leave the GPU off
+until external power is cycled, so keep physical power
 recovery available during testing. `SIGTERM`, `SIGHUP`, `SIGQUIT`, and normal
 keyboard interruption trigger one best-effort recovery ON; `SIGKILL`, host power
 loss, or a failed USB control channel cannot be recovered by the script.

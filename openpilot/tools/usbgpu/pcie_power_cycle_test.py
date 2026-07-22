@@ -179,6 +179,24 @@ def _find_sysfs_path(device: str, sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> Path
   return matches[0]
 
 
+def _detect_device(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> str:
+  matches = []
+  try:
+    candidates = list(sysfs_root.iterdir())
+  except OSError as exc:
+    raise PowerCycleSafetyError(f"unable to scan USB sysfs: {exc}") from exc
+  for path in candidates:
+    if _read_int(path / "idVendor", base=16) != USBGPU_VID or _read_int(path / "idProduct", base=16) != USBGPU_PID:
+      continue
+    busnum, devnum = _read_int(path / "busnum"), _read_int(path / "devnum")
+    if isinstance(busnum, int) and busnum > 0 and isinstance(devnum, int) and devnum > 0:
+      matches.append((busnum, devnum))
+  if len(matches) != 1:
+    raise PowerCycleSafetyError(f"automatic detection expected one ADD1:0001 USB device, found {len(matches)}; use --device when multiple exist")
+  busnum, devnum = matches[0]
+  return f"usb:{busnum}-{devnum}"
+
+
 def _ready_identity(path: Path) -> tuple[str, int, int, int] | None:
   state = _read_sysfs_state(path)
   if state["vendorId"] != f"{USBGPU_VID:04x}" or state["productId"] != f"{USBGPU_PID:04x}":
@@ -398,7 +416,7 @@ def run_power_cycle(device: str, logger: AttemptLog, *, dwell_ms: int = DEFAULT_
 
 def main(argv: list[str] | None = None) -> int:
   parser = argparse.ArgumentParser(description="Bench-only ASM2464 F3 PCIe off/on test with durable JSON logging")
-  parser.add_argument("--device", required=True, help="Current libusb identity, for example usb:4-10")
+  parser.add_argument("--device", help="Optional libusb identity, for example usb:4-10; auto-detected when omitted")
   parser.add_argument("--confirm-risk", action="store_true",
                       help="Confirm that a failed ON may leave the GPU off until external power is cycled")
   parser.add_argument("--dry-run", action="store_true", help="Check lifecycle and device eligibility without sending F3")
@@ -415,16 +433,23 @@ def main(argv: list[str] | None = None) -> int:
     "dwellMs": args.dwell_ms,
     "reenumTimeoutSec": args.reenum_timeout_sec,
     "requiredStableSec": STABLE_DURATION_SEC,
+    "requestedDevice": args.device,
   }
   try:
-    logger = AttemptLog(args.log_dir, args.device, arguments)
-    result = run_power_cycle(args.device, logger, dwell_ms=args.dwell_ms,
+    logger = AttemptLog(args.log_dir, args.device or "auto", arguments)
+    device = args.device or _detect_device()
+    logger.data["device"] = device
+    logger.event("device_selection", "explicit" if args.device else "auto_detected", device=device)
+    result = run_power_cycle(device, logger, dwell_ms=args.dwell_ms,
                              reenum_timeout_sec=args.reenum_timeout_sec, dry_run=args.dry_run)
   except BaseException as exc:
+    if "logger" in locals() and logger.data["status"] == "started":
+      with contextlib.suppress(BaseException):
+        logger.finish("failed", error=_error_details(exc))
     log_path = str(logger.path) if "logger" in locals() else None
     print(json.dumps({"status": "failed", "error": _error_details(exc), "logPath": log_path}, sort_keys=True), file=sys.stderr)
     return 1
-  print(json.dumps({"status": result["status"], "logPath": str(logger.path)}, sort_keys=True))
+  print(json.dumps({"status": result["status"], "device": device, "logPath": str(logger.path)}, sort_keys=True))
   return 0
 
 
