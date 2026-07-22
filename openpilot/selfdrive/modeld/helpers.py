@@ -4,6 +4,7 @@ import pickle
 import shutil
 import struct
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -13,6 +14,12 @@ USBGPU_VID = 0xADD1
 USBGPU_PID = 0x0001
 USBGPU_SYSFS_ROOT = Path("/sys/bus/usb/devices")
 USBGPU_SUPERSPEED_MBIT = 5000
+USBGPU_LINK_ERROR_THRESHOLD = 5.0
+USBGPU_LINK_ERROR_COUNTER_MASK = 0xFFFF
+USBGPU_LINK_SAMPLE_SECONDS = 2.0
+USBGPU_LINK_MIN_GAP_TOLERANCE = 0.5
+
+UsbGpuReadyIdentity = tuple[str, int, int, int]
 
 
 def get_tg_input_devices(process_name: str, usbgpu: bool):
@@ -83,7 +90,7 @@ def usbgpu_speed(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> int | None:
   return max(speeds, default=None)
 
 
-def usbgpu_ready_identity(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> tuple[str, int, int, int] | None:
+def usbgpu_ready_identity(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> UsbGpuReadyIdentity | None:
   identities = []
   for d in _usbgpu_devices(sysfs_root):
     try:
@@ -100,23 +107,139 @@ def usbgpu_ready_identity(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> tuple[str, in
 def usbgpu_superspeed_ready(sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
   return usbgpu_ready_identity(sysfs_root) is not None
 
-def wait_for_usbgpu_ready(timeout: float, stable_duration: float = 0.0, poll_interval: float = 0.1,
-                          sysfs_root: Path = USBGPU_SYSFS_ROOT) -> bool:
-  deadline = time.monotonic() + timeout
-  stable_since = None
-  stable_identity = None
-  while True:
+
+def _usbgpu_controller(device: Path) -> Path | None:
+  try:
+    return next((parent for parent in device.resolve().parents if parent.name.endswith(".ssusb")), None)
+  except OSError:
+    return None
+
+
+def _usbgpu_portli(identity: UsbGpuReadyIdentity) -> Path | None:
+  ctrl = _usbgpu_controller(Path(identity[0]))
+  if ctrl is None:
+    return None
+  portli = ctrl / "portli"
+  return portli if portli.exists() else None
+
+
+def _usbgpu_link_error_count(portli: Path) -> int | None:
+  try:
+    return int(portli.read_text().strip(), 0) & USBGPU_LINK_ERROR_COUNTER_MASK
+  except (OSError, ValueError):
+    return None
+
+
+class UsbGpuLinkMonitor:
+  def __init__(self, sysfs_root: Path = USBGPU_SYSFS_ROOT, poll_interval: float = 0.1):
+    self.sysfs_root = sysfs_root
+    self.poll_interval = poll_interval
+    self._lock = threading.Lock()
+    self._sample_lock = threading.Lock()
+    self._stop_event = threading.Event()
+    self._thread = None
+    self._identity = None
+    self._stable_since = None
+    self._link_errors_required = False
+    self._link_samples = []
+
+  def _reset_locked(self):
+    self._identity = None
+    self._stable_since = None
+    self._link_errors_required = False
+    self._link_samples = []
+
+  def sample(self, blocking: bool = True) -> bool:
+    if not self._sample_lock.acquire(blocking=blocking):
+      return False
+    try:
+      identity = usbgpu_ready_identity(self.sysfs_root)
+      portli = _usbgpu_portli(identity) if identity is not None else None
+      link_errors = _usbgpu_link_error_count(portli) if portli is not None else None
+
+      # Do not accept a stale controller counter after detach or re-enumeration.
+      if identity is not None and usbgpu_ready_identity(self.sysfs_root) != identity:
+        identity = None
+        portli = None
+        link_errors = None
+      now = time.monotonic()
+
+      with self._lock:
+        if identity is None:
+          self._reset_locked()
+          return True
+
+        if identity != self._identity:
+          self._identity = identity
+          self._stable_since = now
+          self._link_errors_required = portli is not None
+          self._link_samples = []
+        elif portli is not None:
+          self._link_errors_required = True
+
+        if self._link_errors_required:
+          if link_errors is None:
+            self._link_samples = []
+          else:
+            self._link_samples.append((now, link_errors))
+            cutoff = now - USBGPU_LINK_SAMPLE_SECONDS
+            while len(self._link_samples) > 2 and self._link_samples[1][0] <= cutoff:
+              self._link_samples.pop(0)
+      return True
+    finally:
+      self._sample_lock.release()
+
+  def _link_error_rate_locked(self, now: float) -> float | None:
+    if len(self._link_samples) < 2:
+      return None
+    started, _ = self._link_samples[0]
+    ended, _ = self._link_samples[-1]
+    elapsed = ended - started
+    max_gap = max(USBGPU_LINK_MIN_GAP_TOLERANCE, self.poll_interval * 1.5)
+    if elapsed < USBGPU_LINK_SAMPLE_SECONDS or elapsed > USBGPU_LINK_SAMPLE_SECONDS + max_gap or now - ended > max_gap:
+      return None
+    total_delta = 0
+    for index in range(1, len(self._link_samples)):
+      previous_time, previous_count = self._link_samples[index - 1]
+      current_time, current_count = self._link_samples[index]
+      if current_time - previous_time > max_gap:
+        return None
+      total_delta += (current_count - previous_count) & USBGPU_LINK_ERROR_COUNTER_MASK
+    return total_delta / elapsed
+
+  def status(self, stable_duration: float) -> tuple[bool, float | None]:
     now = time.monotonic()
-    identity = usbgpu_ready_identity(sysfs_root)
-    if identity is not None:
-      if stable_since is None or identity != stable_identity:
-        stable_since = now
-        stable_identity = identity
-      if now - stable_since >= stable_duration:
-        return True
-    else:
-      stable_since = None
-      stable_identity = None
+    with self._lock:
+      if self._identity is None or self._stable_since is None or now - self._stable_since < stable_duration:
+        return False, None
+      if stable_duration <= 0.0 or not self._link_errors_required:
+        return True, None
+      rate = self._link_error_rate_locked(now)
+      return rate is not None and rate <= USBGPU_LINK_ERROR_THRESHOLD, rate
+
+  def _run(self):
+    while not self._stop_event.wait(self.poll_interval):
+      self.sample()
+
+  def start(self):
+    self.sample()
+    self._thread = threading.Thread(target=self._run, name="usbgpu-link-monitor", daemon=True)
+    self._thread.start()
+
+  def stop(self):
+    self._stop_event.set()
+    if self._thread is not None:
+      self._thread.join(timeout=max(1.0, self.poll_interval * 2))
+
+def wait_for_usbgpu_ready(timeout: float, stable_duration: float = 0.0, poll_interval: float = 0.1,
+                          sysfs_root: Path = USBGPU_SYSFS_ROOT, monitor: UsbGpuLinkMonitor | None = None) -> bool:
+  deadline = time.monotonic() + timeout
+  link_monitor = monitor or UsbGpuLinkMonitor(sysfs_root, poll_interval)
+  while True:
+    link_monitor.sample(blocking=False)
+    ready, _ = link_monitor.status(stable_duration)
+    if ready:
+      return True
     if time.monotonic() >= deadline:
       return False
     time.sleep(poll_interval)

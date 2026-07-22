@@ -22,6 +22,18 @@ class FakeModel:
   lat_delay = 0.25
 
 
+class FakeLinkMonitor:
+  def __init__(self, ready: bool, rate: float | None):
+    self.ready = ready
+    self.rate = rate
+
+  def sample(self, blocking: bool = True):
+    pass
+
+  def status(self, stable_duration: float):
+    return self.ready, self.rate
+
+
 def test_ready_failure_switches_to_qcom_before_runtime(monkeypatch):
   params = FakeParams()
   amd_model = FakeModel()
@@ -60,6 +72,44 @@ def test_ready_success_keeps_amd_and_sets_runtime_timeout(monkeypatch):
   assert params.values["UsbGpuPresent"] is True
   assert params.values["UsbGpuReady"] is True
   assert "UsbGpuInitError" not in params.values
+
+
+def test_model_load_link_sample_skips_duplicate_stability_wait(monkeypatch):
+  params = FakeParams()
+  amd_model = FakeModel()
+  configured = []
+  monitor = FakeLinkMonitor(True, 1.0)
+
+  monkeypatch.setattr(modeld, "wait_for_usbgpu_ready", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duplicate wait")))
+  monkeypatch.setattr(modeld, "usbgpu_present", lambda: True)
+  monkeypatch.setattr(modeld, "configure_usbgpu_runtime", lambda model: configured.append(model))
+
+  model, usbgpu = modeld.finish_usbgpu_startup(amd_model, 1928, 1208, params, monitor)
+
+  assert model is amd_model
+  assert usbgpu
+  assert configured == [amd_model]
+  assert params.values["UsbGpuReady"] is True
+
+
+def test_unstable_model_load_link_sample_requires_link_validation(monkeypatch):
+  params = FakeParams()
+  amd_model = FakeModel()
+  wait_calls = []
+  monitor = FakeLinkMonitor(False, 6.0)
+
+  monkeypatch.setattr(modeld, "wait_for_usbgpu_ready", lambda *args, **kwargs: wait_calls.append((args, kwargs)) or True)
+  monkeypatch.setattr(modeld, "usbgpu_present", lambda: True)
+  monkeypatch.setattr(modeld, "configure_usbgpu_runtime", lambda model: None)
+
+  model, usbgpu = modeld.finish_usbgpu_startup(amd_model, 1928, 1208, params, monitor)
+
+  assert model is amd_model
+  assert usbgpu
+  assert wait_calls == [((modeld.USBGPU_READY_TIMEOUT,), {
+    "stable_duration": modeld.USBGPU_STABLE_DURATION,
+    "monitor": monitor,
+  })]
 
 
 def test_runtime_timeout_configuration_failure_switches_to_qcom(monkeypatch):

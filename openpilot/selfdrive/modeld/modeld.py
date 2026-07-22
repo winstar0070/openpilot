@@ -26,6 +26,7 @@ from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_drivi
 from openpilot.common.file_chunker import open_file_chunked, get_manifest_path
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.egpu_diagnostics import collect_egpu_diagnostics
+from openpilot.selfdrive.modeld.helpers import UsbGpuLinkMonitor
 from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_speed, usbgpu_superspeed_ready, wait_for_usbgpu_present, wait_for_usbgpu_ready
 from openpilot.selfdrive.modeld.helpers import modeld_pkl_path, get_tg_input_devices, load_oob
 
@@ -140,8 +141,22 @@ def fail_over_usbgpu(model, cam_w: int, cam_h: int, params: Params, error: Excep
   return switch_to_qcom(model, cam_w, cam_h, error, mark_lost=False), reason
 
 
-def finish_usbgpu_startup(model, cam_w: int, cam_h: int, params: Params):
-  if not wait_for_usbgpu_ready(USBGPU_READY_TIMEOUT, stable_duration=USBGPU_STABLE_DURATION):
+def finish_usbgpu_startup(model, cam_w: int, cam_h: int, params: Params, link_monitor: UsbGpuLinkMonitor | None = None):
+  if link_monitor is not None:
+    link_monitor.sample(blocking=False)
+    link_validated_during_load, link_rate = link_monitor.status(USBGPU_STABLE_DURATION)
+  else:
+    link_validated_during_load, link_rate = False, None
+  if link_validated_during_load:
+    if link_rate is None:
+      cloudlog.warning("USB GPU identity remained stable during model load")
+    else:
+      cloudlog.warning(f"USB GPU link validated during model load at {link_rate:.1f} errors/s")
+  elif link_rate is not None:
+    cloudlog.warning(f"USB GPU link accumulated {link_rate:.1f} errors/s during model load; waiting for stability")
+
+  if not link_validated_during_load and not wait_for_usbgpu_ready(USBGPU_READY_TIMEOUT, stable_duration=USBGPU_STABLE_DURATION,
+                                                                  monitor=link_monitor):
     error = "AMD probe succeeded but USB device did not remain configured at SuperSpeed"
     cloudlog.error("USB GPU probe succeeded without stable configured SuperSpeed readiness; falling back to QCOM")
     replacement, _ = fail_over_usbgpu(model, cam_w, cam_h, params, RuntimeError(error))
@@ -258,6 +273,12 @@ def main(demo=False):
     params.put("UsbGpuInitError", error)
     cloudlog.error(error)
 
+  # Start before realtime configuration so the polling thread stays low priority.
+  # Its observation window overlaps camera setup and model loading.
+  link_monitor = UsbGpuLinkMonitor() if USBGPU else None
+  if link_monitor is not None:
+    link_monitor.start()
+
   config_realtime_process(7, 54)
 
   # visionipc clients
@@ -296,9 +317,15 @@ def main(demo=False):
     diagnostic_path = log_egpu_diagnostics(e)
     record_usbgpu_failure(params, f"{failure_reason}; diagnostics={diagnostic_path}")
     cloudlog.exception("USB GPU model initialization failed, falling back to QCOM")
+  finally:
+    if link_monitor is not None:
+      link_monitor.stop()
+  model_load_time = time.monotonic() - st
+  link_validation_started = time.monotonic()
   if USBGPU:
-    model, USBGPU = finish_usbgpu_startup(model, vipc_client_main.width, vipc_client_main.height, params)
-  cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
+    model, USBGPU = finish_usbgpu_startup(model, vipc_client_main.width, vipc_client_main.height, params, link_monitor)
+  link_validation_time = time.monotonic() - link_validation_started
+  cloudlog.warning(f"models loaded in {model_load_time:.1f}s, USB GPU validation in {link_validation_time:.1f}s, modeld starting")
 
   # messaging
   pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"])
