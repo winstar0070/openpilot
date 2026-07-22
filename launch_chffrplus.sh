@@ -89,7 +89,7 @@ function launch {
   # start manager
   cd openpilot/system/manager
   if [ ! -f $DIR/prebuilt ]; then
-    ./build.py
+    USBGPU_BOOTSTRAP_POWER_ON_BOOT=1 ./build.py
   fi
   ./manager.py
 

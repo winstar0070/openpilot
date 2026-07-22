@@ -7,9 +7,11 @@ from openpilot.common.file_chunker import chunk_file, get_chunk_targets, get_exi
 from openpilot.common.transformations.camera import _ar_ox_fisheye, _os_fisheye
 from openpilot.common.transformations.model import MEDMODEL_INPUT_SIZE, DM_INPUT_SIZE
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.modeld.helpers import TG_INPUT_DEVICES_PATH, format_usbgpu_build_decision, format_usbgpu_build_device, get_usbgpu_build_diagnostic
+from openpilot.selfdrive.modeld.helpers import TG_INPUT_DEVICES_PATH, format_usbgpu_build_decision, format_usbgpu_build_device, format_usbgpu_pcie_power
+from openpilot.selfdrive.modeld.helpers import get_usbgpu_build_diagnostic
 from openpilot.selfdrive.modeld.helpers import modeld_pkl_path
-from openpilot.selfdrive.modeld.helpers import resolve_usbgpu_build_diagnostic, tinygrad_compiler_probe_script, write_usbgpu_build_diagnostic
+from openpilot.selfdrive.modeld.helpers import request_usbgpu_pcie_power_on, resolve_usbgpu_build_diagnostic
+from openpilot.selfdrive.modeld.helpers import tinygrad_compiler_probe_script, write_usbgpu_build_diagnostic
 
 
 CAMERA_CONFIGS = [
@@ -22,6 +24,7 @@ chunker_file = File("#openpilot/common/file_chunker.py")
 lenv = env.Clone()
 
 tinygrad_root = env.Dir("#").abspath
+tinygrad_repo_root = env.Dir("#tinygrad_repo").abspath
 tinygrad_files = ["#"+x for x in glob.glob(env.Dir("#tinygrad_repo").relpath + "/**", recursive=True, root_dir=tinygrad_root)
                   if 'pycache' not in x and os.path.isfile(os.path.join(tinygrad_root, x))]
 
@@ -40,10 +43,16 @@ def probe_devices():
 
 usbgpu_artifact_path = get_manifest_path(modeld_pkl_path(usbgpu=True))
 initial_usbgpu_build_diagnostic = get_usbgpu_build_diagnostic(usbgpu_artifact_path)
+allow_bootstrap_power = os.getenv("USBGPU_BOOTSTRAP_POWER_ON_BOOT") == "1"
 if initial_usbgpu_build_diagnostic["reasonCode"] == "bootstrap":
-  print('[USBGPU] bootstrap wait: initial_speed=12Mbps; AMD target remains disabled until stable configured 5000Mbps', file=sys.stderr)
+  lifecycle = "launcher-authorized initial build attempt" if allow_bootstrap_power else "blocked without launcher authorization"
+  print(f'[USBGPU] bootstrap power: initial_speed=12Mbps; lifecycle={lifecycle}', file=sys.stderr)
+pcie_power_result = request_usbgpu_pcie_power_on(
+  initial_usbgpu_build_diagnostic, tinygrad_repo_root, allow_power=allow_bootstrap_power)
+if pcie_power_result["pciePowerAction"] is not None:
+  print(format_usbgpu_pcie_power(pcie_power_result), file=sys.stderr)
 usbgpu_build_diagnostic = resolve_usbgpu_build_diagnostic(
-  usbgpu_artifact_path, initial_diagnostic=initial_usbgpu_build_diagnostic)
+  usbgpu_artifact_path, initial_diagnostic=initial_usbgpu_build_diagnostic, pcie_power_result=pcie_power_result)
 print(format_usbgpu_build_decision(usbgpu_build_diagnostic), file=sys.stderr)
 print(format_usbgpu_build_device(usbgpu_build_diagnostic), file=sys.stderr)
 write_usbgpu_build_diagnostic(usbgpu_build_diagnostic)
