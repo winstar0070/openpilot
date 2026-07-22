@@ -16,6 +16,7 @@
 [submodule "tinygrad"]
   path = tinygrad_repo
   url = https://github.com/winstar0070/tinygrad.git
+  branch = ccnc-port-egpu-startup
 [submodule "sunnypilot/neural_network_data"]
 	path = openpilot/sunnypilot/neural_network_data
   url = https://github.com/sunnypilot/neural-network-data.git

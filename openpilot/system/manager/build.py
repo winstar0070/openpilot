@@ -104,6 +104,22 @@ def format_build_error(compile_output: list[bytes], hardware_reason: str | None,
   return error_s
 
 
+def _build_env_for_attempt(parallelism: list[str], force_usbgpu: bool, marker_path: str) -> dict[str, str]:
+  build_env = {
+    **os.environ,
+    "PWD": BASEDIR,
+    "USBGPU_BUILD_FAILURE_MARKER": marker_path,
+    "USBGPU_BUILD_LOCK": str(USBGPU_BUILD_LOCK),
+    "USBGPU_FORCE_BUILD": "1" if force_usbgpu else "0",
+  }
+  # The final SCons retry exists specifically to reduce memory pressure. Keep
+  # tinygrad's nested kernel compiler serial too, otherwise -j1 still spawns
+  # multiple compile workers and can repeat the same OOM failure.
+  if "-j1" in parallelism:
+    build_env["PARALLEL_COMPILE"] = "1"
+  return build_env
+
+
 def build() -> None:
   spinner = Spinner()
   spinner.update_progress(0, 100)
@@ -115,13 +131,7 @@ def build() -> None:
   def run_attempt(parallelism: list[str], force_usbgpu: bool, marker_path: str) -> tuple[int, list[bytes]]:
     compile_output: list[bytes] = []
     cleanup_usbgpu_build_temps()
-    build_env = {
-      **os.environ,
-      "PWD": BASEDIR,
-      "USBGPU_BUILD_FAILURE_MARKER": marker_path,
-      "USBGPU_BUILD_LOCK": str(USBGPU_BUILD_LOCK),
-      "USBGPU_FORCE_BUILD": "1" if force_usbgpu else "0",
-    }
+    build_env = _build_env_for_attempt(parallelism, force_usbgpu, marker_path)
     with subprocess.Popen(["scons", *parallelism], cwd=BASEDIR, env=build_env, stderr=subprocess.PIPE) as scons:
       assert scons.stderr is not None
 

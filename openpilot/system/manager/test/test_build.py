@@ -4,6 +4,15 @@ from pathlib import Path
 import openpilot.system.manager.build as manager_build
 
 
+def test_single_job_retry_serializes_nested_kernel_compilation(monkeypatch, tmp_path):
+  marker = str(tmp_path / "failure.marker")
+  monkeypatch.setenv("PARALLEL_COMPILE", "8")
+
+  assert manager_build._build_env_for_attempt([], False, marker)["PARALLEL_COMPILE"] == "8"
+  assert manager_build._build_env_for_attempt(["-j4"], False, marker)["PARALLEL_COMPILE"] == "8"
+  assert manager_build._build_env_for_attempt(["-j1"], True, marker)["PARALLEL_COMPILE"] == "1"
+
+
 def make_runner(tmp_path, outcomes, calls):
   marker = tmp_path / "failure.marker"
   outcomes = iter(outcomes)
