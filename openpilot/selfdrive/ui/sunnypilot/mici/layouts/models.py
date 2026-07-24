@@ -169,11 +169,16 @@ class ModelsLayoutMici(NavScroller):
       device.set_override_interactive_timeout(None)
     self._was_downloading = is_downloading
 
-    self.current_model_info.current_model_header.set_text(tr("active model"))
+    self.current_model_info.current_model_header.set_text(tr("selected model"))
     model_text = manager.activeBundle.displayName.lower() if manager.activeBundle.ref else f"{DEFAULT_MODEL} (Default)".lower()
     self.current_model_info.current_model_text.set_text(model_text)
-    self.current_model_info.info_header.set_text(tr("cache size"))
-    self.current_model_info.info_text.set_text(f"{ModelsLayout.calculate_cache_size():.2f} MB")
+    if ui_state.modeld_model and ui_state.modeld_backend:
+      runtime_state = f", egpu={ui_state.usbgpu_state}" if ui_state.usbgpu_state else ""
+      self.current_model_info.info_header.set_text(tr("running model"))
+      self.current_model_info.info_text.set_text(f"{ui_state.modeld_model} ({ui_state.modeld_backend}{runtime_state})".lower())
+    else:
+      self.current_model_info.info_header.set_text(tr("cache size"))
+      self.current_model_info.info_text.set_text(f"{ModelsLayout.calculate_cache_size():.2f} MB")
 
     if manager.selectedBundle and manager.selectedBundle.status == custom.ModelManagerSP.DownloadStatus.failed:
       self.current_model_info.info_header.set_text(tr("error") + self._download_progress)
@@ -199,4 +204,3 @@ class ModelsLayoutMici(NavScroller):
       self.current_model_info.info_header.set_text(tr("progress") + self._download_progress)
       self.current_model_info.info_header._shimmer = True
       self.current_model_info.info_text.set_text(f"{progress/count:.2f}%")
-

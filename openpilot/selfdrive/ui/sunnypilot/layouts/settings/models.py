@@ -246,10 +246,14 @@ class ModelsLayout(Widget):
     self._handle_bundle_download_progress()
     active_name = self.model_manager.activeBundle.internalName if self.model_manager and self.model_manager.activeBundle.ref else f"{DEFAULT_MODEL} (Default)"
     self.current_model_item.action_item.set_value(active_name)
+    runtime_description = ""
+    if ui_state.modeld_model and ui_state.modeld_backend:
+      runtime_state = f", eGPU={ui_state.usbgpu_state}" if ui_state.usbgpu_state else ""
+      runtime_description = f"{tr('Running model')}: {ui_state.modeld_model} ({ui_state.modeld_backend}{runtime_state})"
 
     if not ui_state.is_offroad():
       self.current_model_item.action_item.set_enabled(False)
-      self.current_model_item.set_description(tr("Only available when vehicle is off, or always offroad mode is on"))
+      self.current_model_item.set_description(runtime_description or tr("Only available when vehicle is off, or always offroad mode is on"))
     else:
       self.current_model_item.action_item.set_enabled(True)
       self.current_model_item.set_description("")

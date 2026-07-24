@@ -82,6 +82,10 @@ class UIState(UIStateSP):
     self.experimental_mode: bool = self.params.get_bool("ExperimentalMode")
     self.usbgpu: bool = self.params.get_bool("UsbGpuPresent")
     self.usbgpu_compiled: bool = self.params.get_bool("UsbGpuCompiled")
+    self.usbgpu_ready: bool = self.params.get_bool("UsbGpuReady")
+    self.usbgpu_state: str = self.params.get("UsbGpuState") or ""
+    self.modeld_backend: str = self.params.get("ModeldBackend") or ""
+    self.modeld_model: str = self.params.get("ModeldModel") or ""
     self.started: bool = False
     self.ignition: bool = False
     self.recording_audio: bool = False
@@ -213,6 +217,10 @@ class UIState(UIStateSP):
     self.experimental_mode = self.params.get_bool("ExperimentalMode")
     self.usbgpu = self.params.get_bool("UsbGpuPresent")
     self.usbgpu_compiled = self.params.get_bool("UsbGpuCompiled")
+    self.usbgpu_ready = self.params.get_bool("UsbGpuReady")
+    self.usbgpu_state = self.params.get("UsbGpuState") or ""
+    self.modeld_backend = self.params.get("ModeldBackend") or ""
+    self.modeld_model = self.params.get("ModeldModel") or ""
 
     UIStateSP.update_params(self)
 

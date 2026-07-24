@@ -109,7 +109,7 @@ def test_unsupported_speed_requests_one_diagnostic(monkeypatch):
   assert new_failure == params.values["UsbGpuInitError"]
 
 
-def test_ready_success_sets_runtime_timeout_and_ready(monkeypatch):
+def test_ready_success_sets_runtime_timeout_and_waits_for_first_inference(monkeypatch):
   params = FakeParams()
   amd_model = FakeModel()
   configured = []
@@ -122,8 +122,55 @@ def test_ready_success_sets_runtime_timeout_and_ready(monkeypatch):
   assert usbgpu
   assert state is None and reason is None and traceback_text is None
   assert configured == [amd_model]
-  assert params.values["UsbGpuReady"] is True
+  assert params.values["UsbGpuPresent"] is True
+  assert params.values["UsbGpuReady"] is False
+  assert params.values["UsbGpuState"] == "validating"
+  assert params.values["ModeldBackend"] == "USB+AMD"
+  assert params.values["ModeldModel"] == "big_driving_tinygrad.pkl"
   assert "UsbGpuInitError" not in params.values
+
+
+def test_first_inference_output_validation():
+  valid = {
+    key: np.ones((1,), dtype=np.float32)
+    for key in modeld.USBGPU_OUTPUT_VALIDATION_KEYS
+  }
+  modeld.validate_usbgpu_model_output(valid)
+
+  invalid = dict(valid)
+  invalid["plan"] = np.array([np.nan], dtype=np.float32)
+  with pytest.raises(RuntimeError, match="non-finite"):
+    modeld.validate_usbgpu_model_output(invalid)
+
+  missing = dict(valid)
+  missing.pop("pose")
+  with pytest.raises(RuntimeError, match="missing or empty"):
+    modeld.validate_usbgpu_model_output(missing)
+
+
+def test_runtime_watchdog_clears_active_state_on_identity_loss(monkeypatch):
+  params = FakeParams({"UsbGpuReady": True})
+  identity = [("/sys/4-1", 4, 5000, 1)]
+  monkeypatch.setattr(modeld, "usbgpu_ready_identity", lambda: identity[0])
+  monkeypatch.setattr(modeld, "usbgpu_present", lambda: False)
+  watchdog = modeld.UsbGpuRuntimeWatchdog(params)
+
+  identity[0] = None
+  assert not watchdog.check()
+  assert params.values["UsbGpuPresent"] is False
+  assert params.values["UsbGpuReady"] is False
+  assert params.values["UsbGpuState"] == "lost"
+  with pytest.raises(USBDeviceSessionLost, match="runtime identity changed"):
+    watchdog.raise_if_lost()
+
+
+def test_ready_is_published_only_after_real_model_run():
+  source = inspect.getsource(modeld.main)
+  run = source.index("model_output = model.run(bufs")
+  validate = source.index("validate_usbgpu_model_output(model_output)", run)
+  ready = source.index('params.put_bool("UsbGpuReady", True)', validate)
+
+  assert run < validate < ready
 
 
 def test_ready_failure_marks_device_lost_before_qcom_load(monkeypatch):
