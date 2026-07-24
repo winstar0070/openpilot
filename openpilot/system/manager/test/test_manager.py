@@ -26,6 +26,21 @@ def panda_state(*, ignition_line=False, ignition_can=False, known=True):
   )
 
 
+@pytest.mark.parametrize("present,compiled,diagnostic,expected_state,expected_info", [
+  (True, True, {"decision": "enable_target", "reasonCode": "superspeed"},
+   "standby", "state=standby, target=enabled, artifact=ready, reason=superspeed"),
+  (True, False, {"decision": "skip_target", "reasonCode": "bootstrap"},
+   "build_skipped", "state=build_skipped, target=skipped, artifact=missing, reason=bootstrap"),
+  (True, False, {"decision": "enable_target", "reasonCode": "superspeed"},
+   "build_missing", "state=build_missing, target=enabled, artifact=missing, reason=superspeed"),
+  (False, True, {"decision": "enable_target", "reasonCode": "superspeed"},
+   "detached", "state=detached, target=enabled, artifact=ready, reason=superspeed"),
+  (False, False, None, "absent", "state=absent, target=unknown, artifact=missing"),
+])
+def test_get_usbgpu_offroad_status(present, compiled, diagnostic, expected_state, expected_info):
+  assert manager.get_usbgpu_offroad_status(present, compiled, diagnostic) == (expected_state, expected_info)
+
+
 class TestManager:
   def setup_method(self):
     HARDWARE.set_power_save(False)

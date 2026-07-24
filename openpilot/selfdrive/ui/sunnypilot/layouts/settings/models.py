@@ -256,7 +256,7 @@ class ModelsLayout(Widget):
       self.current_model_item.set_description(runtime_description or tr("Only available when vehicle is off, or always offroad mode is on"))
     else:
       self.current_model_item.action_item.set_enabled(True)
-      self.current_model_item.set_description("")
+      self.current_model_item.set_description(f"eGPU: {ui_state.usbgpu_build_info}" if ui_state.usbgpu_build_info else "")
 
   def _render(self, rect):
     self._scroller.render(rect)

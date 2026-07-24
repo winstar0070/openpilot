@@ -176,6 +176,9 @@ class ModelsLayoutMici(NavScroller):
       runtime_state = f", egpu={ui_state.usbgpu_state}" if ui_state.usbgpu_state else ""
       self.current_model_info.info_header.set_text(tr("running model"))
       self.current_model_info.info_text.set_text(f"{ui_state.modeld_model} ({ui_state.modeld_backend}{runtime_state})".lower())
+    elif ui_state.usbgpu_build_info:
+      self.current_model_info.info_header.set_text("eGPU status")
+      self.current_model_info.info_text.set_text(ui_state.usbgpu_build_info)
     else:
       self.current_model_info.info_header.set_text(tr("cache size"))
       self.current_model_info.info_text.set_text(f"{ModelsLayout.calculate_cache_size():.2f} MB")

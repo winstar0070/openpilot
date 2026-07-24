@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import datetime
+import json
 import os
 import signal
 import sys
@@ -20,8 +21,58 @@ from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_I
 from openpilot.common.swaglog import cloudlog, add_file_handler
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware.hw import Paths
+from openpilot.common.file_chunker import get_manifest_path
+from openpilot.selfdrive.modeld.helpers import USBGPU_BUILD_DIAGNOSTIC_PATH, modeld_pkl_path, usbgpu_present
 
 from openpilot.sunnypilot.system.params_migration import run_migration
+
+
+def get_usbgpu_offroad_status(present: bool, compiled: bool,
+                              diagnostic: dict[str, object] | None) -> tuple[str, str]:
+  diagnostic = diagnostic or {}
+  decision = diagnostic.get("decision")
+  reason = diagnostic.get("reasonCode")
+  target = "enabled" if decision == "enable_target" else "skipped" if decision == "skip_target" else "unknown"
+  artifact = "ready" if compiled else "missing"
+
+  if not present:
+    state = "detached" if compiled else "absent"
+  elif compiled:
+    state = "standby"
+  elif decision == "enable_target":
+    state = "build_missing"
+  elif decision == "skip_target":
+    state = "build_skipped"
+  else:
+    state = "build_unknown"
+
+  reason_text = f", reason={reason}" if isinstance(reason, str) and reason else ""
+  return state, f"state={state}, target={target}, artifact={artifact}{reason_text}"
+
+
+def sync_usbgpu_offroad_status(params: Params) -> None:
+  present = usbgpu_present()
+  compiled = os.path.isfile(get_manifest_path(modeld_pkl_path(usbgpu=True)))
+  try:
+    with open(USBGPU_BUILD_DIAGNOSTIC_PATH) as f:
+      diagnostic = json.load(f)
+  except (OSError, json.JSONDecodeError):
+    diagnostic = None
+
+  state, build_info = get_usbgpu_offroad_status(present, compiled, diagnostic)
+  values = {
+    "UsbGpuPresent": present,
+    "UsbGpuCompiled": compiled,
+    "UsbGpuReady": False,
+    "UsbGpuState": state,
+    "UsbGpuBuildInfo": build_info,
+  }
+  for key, value in values.items():
+    if isinstance(value, bool):
+      if params.get_bool(key) != value:
+        params.put_bool(key, value)
+    elif params.get(key) != value:
+      params.put(key, value)
 
 
 def should_clear_usbgpu_init_error(device_state_started: bool, device_state_valid: bool,
@@ -69,6 +120,7 @@ def manager_init() -> None:
     default_value = params.get_default_value(k)
     if default_value is not None and params.get(k) is None:
       params.put(k, default_value, block=True)
+  sync_usbgpu_offroad_status(params)
 
   # Create folders needed for msgq
   try:
@@ -159,6 +211,9 @@ def manager_thread() -> None:
       params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
     elif not started and started_prev:
       params.clear_all(ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
+
+    if not started:
+      sync_usbgpu_offroad_status(params)
 
     ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
     if ignition and not ignition_prev:
