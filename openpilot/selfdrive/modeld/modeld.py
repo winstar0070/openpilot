@@ -33,6 +33,7 @@ from openpilot.selfdrive.modeld.egpu_diagnostics import collect_egpu_diagnostics
 from openpilot.selfdrive.modeld.helpers import USBGPU_SUPERSPEED_MBIT, usbgpu_present, usbgpu_ready_identity, usbgpu_speed, usbgpu_speed_eligible
 from openpilot.selfdrive.modeld.helpers import wait_for_usbgpu_present, wait_for_usbgpu_ready
 from openpilot.selfdrive.modeld.helpers import modeld_pkl_path, get_tg_input_devices, load_oob
+from openpilot.selfdrive.modeld.usbgpu_link import wait_usbgpu_link
 
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
@@ -380,7 +381,7 @@ class ModelState(ModelStateBase):
     self.frame_skip = ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ
     self.input_queues, self.npy = make_input_queues(self.input_shapes, self.frame_skip, device=self.QUEUE_DEV)
     self.full_frames: dict[str, Tensor] = {}
-    self._blob_cache: dict[int, Tensor] = {}
+    self._blob_cache: dict[tuple[str, int], Tensor] = {}
     self.parser = Parser()
     self.frame_buf_params = {k: get_nv12_info(cam_w, cam_h) for k in ('img', 'big_img')}
     self.run_policy = jits['run_policy']
@@ -456,6 +457,8 @@ def main(demo=False):
   if use_extra_client:
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
+  if USBGPU:
+    wait_usbgpu_link()
   st = time.monotonic()
   cloudlog.warning("loading model")
   pending_egpu_diagnostic: tuple[str, str | None] | None = (selection_failure, None) if selection_failure is not None else None

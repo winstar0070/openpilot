@@ -49,19 +49,19 @@ class ChunkStream(io.RawIOBase):
 
   def readinto(self, b):
     n = 0
+    view = memoryview(b)
     while n < len(b):
       if self._file is None:
         p = next(self._paths, None)
         if p is None:
           break
         self._file = open(p, 'rb')
-
-      read = self._file.readinto(memoryview(b)[n:])
-      if read:
-        n += read
-      else:
+      count = self._file.readinto(view[n:])
+      if not count:
         self._file.close()
         self._file = None
+        continue
+      n += count
     return n
 
   def close(self):
