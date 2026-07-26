@@ -31,10 +31,6 @@ dependencies = [
   "comma-deps-git-lfs",
   "comma-deps-gcc-arm-none-eabi",
 
-  # logging
-  "pyzmq",
-  "sentry-sdk",
-
   # athena
   "PyJWT[crypto]",
   "websocket_client",
@@ -43,16 +39,16 @@ dependencies = [
   "inputs",
 
   # these should be removed
+  "pyzmq",
+  "sentry-sdk",
   "setproctitle",
-
-  # logreader
-  "zstandard",
+  "jeepney",
+  "pillow",
+  "zstandard",  # this can go once we're on Python 3.14+
 
   # ui
   "comma-deps-raylib",
   "qrcode",
-  "jeepney",
-  "pillow",
 ]
 
 [project.optional-dependencies]
@@ -65,10 +61,7 @@ testing = [
   "hypothesis ==6.47.*",
   "ty",
   "pytest",
-  "pytest-cpp",
-  "pytest-subtests",
-  # https://github.com/pytest-dev/pytest-xdist/pull/1229
-  "pytest-xdist @ git+https://github.com/sshane/pytest-xdist@2b4372bd62699fb412c4fe2f95bf9f01bd2018da",
+  "pytest-xdist",
   "pytest-mock",
   "ruff",
   "codespell",
@@ -80,7 +73,6 @@ dev = [
 
 tools = [
   "comma-deps-imgui",
-  "comma-deps-bzip2",
   "comma-deps-bootstrap-icons",
   "comma-deps-libusb",
   "comma-deps-ncurses",
@@ -121,8 +113,6 @@ allow-direct-references = true
 [tool.pytest.ini_options]
 minversion = "6.0"
 addopts = "-Werror --strict-config --strict-markers --durations=10 -n auto --dist=loadgroup"
-cpp_files = "test_*"
-cpp_harness = "openpilot/selfdrive/test/cpp_harness.py"
 python_files = "test_*.py"
 markers = [
   "slow: tests that take awhile to run and can be skipped with -m 'not slow'",
