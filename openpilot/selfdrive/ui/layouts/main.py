@@ -25,7 +25,7 @@ class MainLayout(Widget):
   def __init__(self):
     super().__init__()
 
-    self._pm = messaging.PubMaster(['bookmarkButton', 'userBookmark'])
+    self._pm = messaging.PubMaster(['bookmarkButton'])
 
     self._sidebar = Sidebar()
     self._current_mode = MainState.HOME
@@ -114,9 +114,8 @@ class MainLayout(Widget):
     self.open_settings(PanelType.DEVICE)
 
   def _on_bookmark_clicked(self):
-    for service in ('bookmarkButton', 'userBookmark'):
-      msg = messaging.new_message(service, valid=True)
-      self._pm.send(service, msg)
+    msg = messaging.new_message('bookmarkButton', valid=True)
+    self._pm.send('bookmarkButton', msg)
 
   def _on_onroad_clicked(self):
     self._sidebar.set_visible(not self._sidebar.is_visible)
