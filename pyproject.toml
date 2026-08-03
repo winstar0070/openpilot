@@ -8,6 +8,12 @@ authors = [
   {name = "Vehicle Researcher", email="user@comma.ai"}
 ]
 
+# ------------------------------------------
+# > this dependencies list *only* goes down.
+# ------------------------------------------
+# Linux and Python is all we need, otherwise
+# we write and own the lines ourselves.
+# ------------------------------------------
 dependencies = [
   # multiple users
   "sounddevice",  # micd + soundd
@@ -43,7 +49,6 @@ dependencies = [
   "sentry-sdk",
   "setproctitle",
   "jeepney",
-  "pillow",
   "zstandard",  # this can go once we're on Python 3.14+
 
   # ui
@@ -52,19 +57,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-docs = [
-  "zensical",
-]
-
 testing = [
-  "coverage",
+  "coverage",   # line coverage
   "hypothesis ==6.47.*",
-  "ty",
+  "ty",         # type checking
   "pytest",
   "pytest-xdist",
   "pytest-mock",
-  "ruff",
-  "codespell",
+  "ruff",       # linting
+  "codespell",  # spellcheck
 ]
 
 dev = [
@@ -72,6 +73,8 @@ dev = [
 ]
 
 tools = [
+  "matplotlib",
+
   "comma-deps-imgui",
   "comma-deps-bootstrap-icons",
   "comma-deps-libusb",
@@ -165,7 +168,7 @@ lint.flake8-implicit-str-concat.allow-multiline = false
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "pytest.main".msg = "pytest.main requires special handling that is easy to mess up!"
-"time.time".msg = "Use time.monotonic"  # time.time can skip due to its reference clock, you probably want a monotonic clock
+"time.time".msg = "Use time.monotonic. time.time can skip due to its reference clock, you probably want a monotonic clock"
 
 # raylib banned APIs
 "pyray.measure_text_ex".msg = "Use openpilot.system.ui.lib.text_measure"
