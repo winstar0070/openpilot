@@ -283,8 +283,10 @@ class Car:
       # ccNC HUD: expose lane-change state (modelV2.meta) to the CarController for display
       # smoothing/transition timing. Guarded: missing modelV2 leaves the last value.
       if self.sm.valid['modelV2']:
-        self.CI.CC.lane_change_state = int(self.sm['modelV2'].meta.laneChangeState)
-        self.CI.CC.lane_change_direction = int(self.sm['modelV2'].meta.laneChangeDirection)
+        # capnp enums are _DynamicEnum, not int-castable directly; .raw gives the integer.
+        meta = self.sm['modelV2'].meta
+        self.CI.CC.lane_change_state = meta.laneChangeState.raw
+        self.CI.CC.lane_change_direction = meta.laneChangeDirection.raw
       self.last_actuators_output, can_sends = self.CI.apply(CC, convert_carControlSP(CC_SP), now_nanos)
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
 
