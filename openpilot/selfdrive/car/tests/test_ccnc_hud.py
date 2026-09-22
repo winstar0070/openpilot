@@ -10,6 +10,7 @@ class TestCcncHud(unittest.TestCase):
     self.controller = SimpleNamespace(ccnc_model=None)
     self.model = SimpleNamespace(laneLines=[SimpleNamespace(x=[0.0], y=[y]) for y in (-5.4, -1.8, 1.8, 5.4)],
                                  laneLineProbs=[0.9] * 4, laneLineStds=[0.1] * 4,
+                                 roadEdges=[SimpleNamespace(x=[0.0], y=[y]) for y in (-9.0, 9.0)], roadEdgeStds=[0.1, 0.1],
                                  meta=SimpleNamespace(laneChangeState=SimpleNamespace(raw=2), laneChangeDirection=SimpleNamespace(raw=1)))
 
   def test_fresh_snapshot_and_expired_invalid_or_future_data(self):
@@ -28,6 +29,11 @@ class TestCcncHud(unittest.TestCase):
     for line, y in zip(model.laneLines, (-5.4, -1.8, 1.8, 5.4), strict=True):
       line.x = [0.0]
       line.y = [y]
+    model.init('roadEdges', 2)
+    for edge, y in zip(model.roadEdges, (-9.0, 9.0), strict=True):
+      edge.x = [0.0]
+      edge.y = [y]
+    model.roadEdgeStds = [0.1, 0.1]
     model.laneLineProbs = [0.9] * 4
     model.laneLineStds = [0.1] * 4
     model.meta.laneChangeState = 'laneChangeStarting'
@@ -35,6 +41,7 @@ class TestCcncHud(unittest.TestCase):
     update_ccnc_model(self.controller, model.as_reader(), True, 1_000_000_000, 1_050_000_000)
     self.assertEqual((self.controller.ccnc_model.state, self.controller.ccnc_model.direction), (2, 1))
     self.assertAlmostEqual(self.controller.ccnc_model.lanes[1], -1.8)
+    self.assertEqual(self.controller.ccnc_model.edges, (-9.0, 9.0))
 
   def test_other_car_controller_untouched(self):
     controller = SimpleNamespace()
