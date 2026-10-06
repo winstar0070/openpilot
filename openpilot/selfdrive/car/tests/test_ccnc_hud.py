@@ -1,4 +1,5 @@
 import unittest
+import math
 from types import SimpleNamespace
 
 from openpilot.selfdrive.car.ccnc_hud import update_ccnc_model, update_ccnc_radar
@@ -16,6 +17,28 @@ class TestCcncHud(unittest.TestCase):
                                  laneLineProbs=[0.9] * 4, laneLineStds=[0.1] * 4,
                                  roadEdges=[SimpleNamespace(x=[0.0], y=[y]) for y in (-9.0, 9.0)], roadEdgeStds=[0.1, 0.1],
                                  meta=SimpleNamespace(laneChangeState=SimpleNamespace(raw=2), laneChangeDirection=SimpleNamespace(raw=1)))
+
+  def test_raw_can_display_source_does_not_mutate_scc(self):
+    from opendbc.car.hyundai.ccnc_radar import CcncRadarTracks
+    from opendbc.car.hyundai.tests.test_ccnc_radar import cycle
+    self.controller.ccnc_raw_radar = CcncRadarTracks()
+    radar = structs.RadarData()
+    radar.points = [structs.RadarData.RadarPoint(trackId=7, dRel=25., yRel=float('nan'), vRel=0.)]
+    for line in self.model.laneLines:
+      line.x = [0., 80.]
+      line.y = line.y * 2
+    update_ccnc_model(self.controller, self.model, True, 1_000_000_000, 1_000_000_000)
+    update_ccnc_radar(self.controller, radar, True, 1_000_000_000, [(1, cycle())])
+    values = CcncObjectDisplay().update(self.controller.ccnc_radar, self.controller.ccnc_object_lanes, 1.)
+    self.assertEqual(values['LEAD_LEFT'], 2)
+    self.assertAlmostEqual(values['LEAD_LEFT_DISTANCE'], 14.2)
+    self.assertAlmostEqual(values['LEAD_LEFT_LATERAL'], 3.2)
+    self.assertEqual(radar.points[0].dRel, 25.)
+    self.assertTrue(math.isnan(radar.points[0].yRel))
+    update_ccnc_radar(self.controller, radar, False, 1_010_000_000)
+    self.assertIsNone(self.controller.ccnc_radar)
+    update_ccnc_radar(self.controller, radar, True, 1_020_000_000, [(2, cycle()[:16])])
+    self.assertIsNone(self.controller.ccnc_radar)
 
   def test_fresh_snapshot_and_expired_invalid_or_future_data(self):
     update_ccnc_model(self.controller, self.model, True, 1_000_000_000, 1_100_000_000)
