@@ -20,7 +20,7 @@ from opendbc.car.car_helpers import get_car, interfaces
 from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
-from openpilot.selfdrive.car.ccnc_hud import update_ccnc_model, update_ccnc_radar
+from openpilot.selfdrive.car.ccnc_hud import update_ccnc_model, update_ccnc_probe, update_ccnc_radar
 from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_capnp
 
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
@@ -281,9 +281,12 @@ class Car:
       # signal pandad to switch to car safety mode
       self.params.put_bool("ControlsReady", True)
 
+    now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
+    control_fresh = (self.sm.valid['carControl'] and self.sm.all_alive(['carControl']) and
+                     0 <= now_nanos - self.sm.logMonoTime['carControl'] <= 250_000_000)
+    update_ccnc_probe(self.CI.CC, enabled=not REPLAY and control_fresh)
     if self.sm.all_alive(['carControl']):
       # send car controls over can
-      now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
       update_ccnc_model(self.CI.CC, self.sm['modelV2'],
                         self.sm.valid['modelV2'] and self.sm.all_alive(['modelV2']),
                         self.sm.logMonoTime['modelV2'], now_nanos)
@@ -301,6 +304,8 @@ class Car:
                    self.sm.seen['onroadEvents'])
     if not self.CP.passive and initialized:
       self.controls_update(CS, self.sm['carControl'], self.sm['carControlSP'])
+    else:
+      update_ccnc_probe(self.CI.CC, enabled=False)
 
     self.initialized_prev = initialized
     self.CS_prev = CS

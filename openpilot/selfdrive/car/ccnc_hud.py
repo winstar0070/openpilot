@@ -1,6 +1,51 @@
 """Fresh model snapshots for the Hyundai ccNC display; no control inputs."""
+import json
+import os
+import stat
+
 from opendbc.car.hyundai.ccnc_model import read_model_lanes
 from opendbc.car.hyundai.ccnc_objects import read_object_lanes, read_radar_objects
+
+CCNC_SLOT_PROBE_PATH = '/dev/shm/ccnc-slot-probe.json'
+
+
+def _unique_object(pairs):
+  result = {}
+  for key, value in pairs:
+    if key in result:
+      raise ValueError('duplicate request key')
+    result[key] = value
+  return result
+
+
+def _read_probe_request(path):
+  fd = None
+  try:
+    # Never block card on a FIFO or follow a substituted symlink.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_size > 1024 or
+        info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022):
+      return None
+    raw = os.read(fd, 1025)
+    if len(raw) > 1024:
+      return None
+    request = json.loads(raw.decode('utf-8'), object_pairs_hook=_unique_object)
+    return request if type(request) is dict else None
+  except (OSError, UnicodeError, ValueError):
+    return None
+  finally:
+    if fd is not None:
+      os.close(fd)
+
+
+def update_ccnc_probe(controller, enabled=True, path=CCNC_SLOT_PROBE_PATH):
+  if hasattr(controller, 'ccnc_probe_request'):
+    # Replay must never consume a live operator request. The controller checks
+    # gear, speed, control state and the camera frame age on every apply call.
+    controller.ccnc_probe_request = _read_probe_request(path) if enabled else None
+    if not enabled and hasattr(controller, 'ccnc_probe'):
+      controller.ccnc_probe.cancel()
 
 
 def update_ccnc_model(controller, model, valid, model_time_ns, now_ns):
