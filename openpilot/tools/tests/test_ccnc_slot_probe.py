@@ -21,6 +21,25 @@ def safe_sm(now=1_000_000_000):
 
 
 class TestSlotProbe(unittest.TestCase):
+  def test_demo_plan_is_multiple_slots_and_fixed_lease_motion(self):
+    output = io.StringIO()
+    with patch.object(probe, 'run', side_effect=AssertionError('live path')), contextlib.redirect_stdout(output):
+      self.assertEqual(probe.main(['--demo', '--dry-run']), 0)
+    phases = json.loads(output.getvalue())
+    self.assertEqual(len(phases), 7)
+    self.assertEqual([m['slot'] for m in phases[0]['markers']], ['FRONT', 'ALT'])
+    self.assertEqual(len(phases[3]['markers']), 6)
+    self.assertEqual([m['status'] for m in phases[4]['markers']], [2, 2, 2, 2, 4, 4])
+    self.assertTrue(all(m['distance'] > m['end_distance'] for m in phases[5]['markers'][:4]))
+    self.assertTrue(all(m['distance'] < m['end_distance'] for m in phases[5]['markers'][4:]))
+    req = probe.request(phases[5], 1_000_000_000)
+    self.assertEqual(set(req), {'token', 'issued_ns', 'expires_ns', 'markers'})
+    self.assertEqual(req['expires_ns'] - req['issued_ns'], 8_000_000_000)
+    self.assertLess(len(json.dumps(req, separators=(',', ':')).encode()), 1024)
+    for args in (['--demo', '--seconds', '2'], ['--demo', '--status', '4'], ['--demo', '--lateral', '2']):
+      with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+        probe.parse_args(args)
+
   def test_args_plan_and_no_io_dry_run(self):
     output = io.StringIO()
     with patch.object(probe, 'run', side_effect=AssertionError('live path')), contextlib.redirect_stdout(output):
@@ -79,6 +98,42 @@ class TestSlotProbe(unittest.TestCase):
 
 
 class TestLiveProtocol(unittest.TestCase):
+  def test_demo_model_packing_and_cli_ack_agree(self):
+    from opendbc.can import CANPacker
+    from opendbc.car.hyundai.ccnc_probe import CcncSlotProbe
+    packer = CANPacker('hyundai_canfd_generated')
+    for phase in probe.plan(probe.parse_args(['--demo'])):
+      model = CcncSlotProbe()
+      req = probe.request(phase, 1_000_000_000)
+      for now in (1_000_000_000, 3_000_000_000, 5_000_000_000, 8_900_000_000):
+        values = model.update(req, now_ns=now, parked=True, stationary=True, controls_inactive=True,
+                              can_valid=True, display_fresh=True)
+        self.assertIsNotNone(values)
+        msg = NS(address=0x162, src=0, dat=packer.make_can_msg('CCNC_0x162', 0, values)[1])
+        self.assertTrue(probe.marker_observed([msg], req, now + 5_000_000))
+
+  def test_demo_ack_multiple_slots_and_time_varying_distances(self):
+    from opendbc.can import CANPacker
+    packer = CANPacker('hyundai_canfd_generated')
+    phases = probe.plan(probe.parse_args(['--demo']))
+    for phase in phases:
+      req = probe.request(phase, 1_000_000_000)
+      values = {}
+      for marker in req['markers']:
+        prefix = 'LEAD' if marker['slot'] == 'FRONT' else 'LEAD_' + marker['slot']
+        status = prefix + '_STATUS' if marker['slot'].endswith('REAR') else prefix
+        values.update({status: marker['status'], prefix + '_DISTANCE': (marker['distance'] + marker['end_distance']) / 2,
+                       prefix + '_LATERAL': marker['lateral']})
+      msg = NS(address=0x162, src=0, dat=packer.make_can_msg('CCNC_0x162', 0, values)[1])
+      self.assertTrue(probe.marker_observed([msg], req, 5_000_000_000))
+      if any(m['distance'] != m['end_distance'] for m in req['markers']):
+        self.assertFalse(probe.marker_observed([msg], req, 1_000_000_000))
+      first = req['markers'][0]
+      field = 'LEAD' if first['slot'] == 'FRONT' else 'LEAD_' + first['slot']
+      values[field] = 0
+      msg.dat = packer.make_can_msg('CCNC_0x162', 0, values)[1]
+      self.assertFalse(probe.marker_observed([msg], req, 5_000_000_000))
+
   def test_ack_crc_and_all_eighteen_fields(self):
     from opendbc.can import CANPacker
     packer = CANPacker('hyundai_canfd_generated')
@@ -99,7 +154,7 @@ class TestLiveProtocol(unittest.TestCase):
       self.assertFalse(probe.marker_observed([msg], req))
 
   def test_run_ack_abort_cleanup_scan_and_preflight(self):
-    for mode in ('ok', 'no_ack', 'unsafe', 'interrupt', 'preflight', 'write_error', 'scan', 'short_no_ack'):
+    for mode in ('ok', 'no_ack', 'unsafe', 'interrupt', 'preflight', 'write_error', 'scan', 'short_no_ack', 'demo', 'motion_stopped'):
       with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
         clock = [1_000_000_000]
         request_path = Path(tmp) / 'req'
@@ -121,16 +176,22 @@ class TestLiveProtocol(unittest.TestCase):
             raise KeyboardInterrupt
 
         sm.update = update
-        args = ['--scan', '--seconds', '.2'] if mode == 'scan' else ['--slot', 'left', '--seconds', '.2' if mode == 'short_no_ack' else '3']
+        args = (['--demo', '--seconds', '3'] if mode in ('demo', 'motion_stopped') else
+                ['--scan', '--seconds', '.2'] if mode == 'scan' else
+                ['--slot', 'left', '--seconds', '.2' if mode == 'short_no_ack' else '3'])
         phases = probe.plan(probe.parse_args(args))
+        if mode == 'motion_stopped':
+          phases = phases[5:6]
+        def ack(*unused, mode=mode, ticks=ticks):
+          return mode not in ('no_ack', 'short_no_ack') and not (mode == 'motion_stopped' and ticks[0] > 5)
         with patch.object(probe, 'subscriber', return_value=sm), patch.object(probe, 'REQUEST_PATH', request_path), \
              patch.object(probe, 'LOCK_PATH', Path(tmp) / 'lock'), patch.object(probe.time, 'monotonic_ns', side_effect=lambda clock=clock: clock[0]), \
-             patch.object(probe, 'marker_observed', return_value=mode not in ('no_ack', 'short_no_ack')), contextlib.redirect_stdout(io.StringIO()):
+             patch.object(probe, 'marker_observed', side_effect=ack), contextlib.redirect_stdout(io.StringIO()):
           if mode == 'write_error':
             with patch.object(probe.os, 'replace', side_effect=OSError('write error')), self.assertRaises(OSError):
               probe.run(phases)
             self.assertEqual([p.name for p in Path(tmp).iterdir()], ['lock'])
-          elif mode in ('no_ack', 'short_no_ack', 'unsafe', 'preflight'):
+          elif mode in ('no_ack', 'short_no_ack', 'unsafe', 'preflight', 'motion_stopped'):
             with self.assertRaises(RuntimeError):
               probe.run(phases)
           elif mode == 'interrupt':

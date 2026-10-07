@@ -31,6 +31,7 @@ def parse_args(argv=None):
   group = parser.add_mutually_exclusive_group(required=True)
   group.add_argument('--slot', choices=[s.lower().replace('_', '-') for s in SLOTS])
   group.add_argument('--scan', action='store_true', help='Six status-2 slots, then both rear slots with status 4; 2-second gaps')
+  group.add_argument('--demo', action='store_true', help='Simultaneous slots and forward/rear distance sweeps; record all seven phases')
   parser.add_argument('--seconds', type=float, default=8., help='Seconds per marker (0 < seconds <= 10)')
   parser.add_argument('--status', type=int, choices=(1, 2, 3, 4), default=2)
   parser.add_argument('--distance', type=float, default=8., help='Marker distance in meters, 0.1..25.5')
@@ -47,10 +48,30 @@ def parse_args(argv=None):
     parser.error('Non-rear slots support only status 1 or 2')
   if args.scan and args.status != 2:
     parser.error('--scan fixes status 2 for six slots, then 4 for the two rear slots')
+  if args.demo and (args.seconds < 3 or args.status != 2 or args.distance != 8 or args.lateral is not None):
+    parser.error('--demo uses fixed positions/statuses and requires 3..10 seconds per phase')
   return args
 
 
 def plan(args):
+  if args.demo:
+    def marker(slot, distance, end=None, status=2):
+      return {'slot': slot, 'status': status, 'distance': distance, 'end_distance': distance if end is None else end,
+              'lateral': 0. if slot in ('FRONT', 'ALT') else 3.6}
+
+    all_static = [marker(s, d) for s, d in zip(SLOTS, (8., 18., 12., 12., 6., 6.), strict=True)]
+    profiles = [
+      ('중앙 앞차 두 슬롯: 8m / 18m', all_static[:2]),
+      ('왼쪽 앞·뒤 슬롯', [all_static[2], all_static[4]]),
+      ('오른쪽 앞·뒤 슬롯', [all_static[3], all_static[5]]),
+      ('6개 슬롯 동시 표시: 상태 2', all_static),
+      ('6개 슬롯 동시 표시: 옆뒤 상태 4', [dict(m, status=4 if m['slot'].endswith('REAR') else 2) for m in all_static]),
+      ('거리 이동: 앞차 접근 / 옆뒤 멀어짐',
+       [marker(s, a, b) for s, a, b in zip(SLOTS, (20., 25., 20., 20., 5., 5.), (5., 10., 5., 5., 20., 20.), strict=True)]),
+      ('거리 이동: 앞차 멀어짐 / 옆뒤 접근',
+       [marker(s, a, b) for s, a, b in zip(SLOTS, (5., 10., 5., 5., 20., 20.), (20., 25., 20., 20., 5., 5.), strict=True)]),
+    ]
+    return [{'label': label, 'markers': markers, 'seconds': args.seconds} for label, markers in profiles]
   slots = [(s, 2) for s in SLOTS] + [('LEFT_REAR', 4), ('RIGHT_REAR', 4)] if args.scan else [
     (args.slot.upper().replace('-', '_'), args.status)]
   return [{'slot': slot, 'status': status, 'distance': round(args.distance, 1),
@@ -59,6 +80,8 @@ def plan(args):
 
 
 def request(phase, now):
+  if 'markers' in phase:
+    return {'token': uuid.uuid4().hex, 'issued_ns': now, 'expires_ns': now + int(phase['seconds'] * 1e9), 'markers': phase['markers']}
   return dict(token=uuid.uuid4().hex, issued_ns=now, expires_ns=now + int(phase['seconds'] * 1e9),
               **{k: phase[k] for k in ('slot', 'status', 'distance', 'lateral')})
 
@@ -119,7 +142,7 @@ def raw_field(data, start, width, little):
   return value
 
 
-def marker_observed(messages, req):
+def marker_observed(messages, req, now_ns=None):
   # Import only in live/ack mode. Dry-run needs no native or vehicle libraries.
   from opendbc.car.hyundai.hyundaicanfd import hkg_can_fd_checksum
   for msg in messages:
@@ -128,9 +151,27 @@ def marker_observed(messages, req):
     data = bytes(msg.dat)
     if hkg_can_fd_checksum(0x162, None, data) != int.from_bytes(data[:2], 'little'):
       continue
-    expected = (req['status'], round(req['distance'] * 10), round(req['lateral'] * 10))
-    if all(tuple(raw_field(data, *field) for field in fields) == (expected if slot == req['slot'] else (0, 0, 0))
-           for slot, fields in FIELDS.items()):
+    markers = req.get('markers', [req])
+    fraction = 0.
+    if 'markers' in req:
+      elapsed = (now_ns if now_ns is not None else req['issued_ns']) - req['issued_ns']
+      fraction = max(0., min(1., elapsed / (req['expires_ns'] - req['issued_ns'])))
+    expected = {}
+    moving = set()
+    for marker in markers:
+      distance = marker['distance'] + (marker.get('end_distance', marker['distance']) - marker['distance']) * fraction
+      slot = marker['slot']
+      expected[slot] = (marker['status'], round(distance * 10), round(marker['lateral'] * 10))
+      if marker.get('end_distance', marker['distance']) != marker['distance']:
+        moving.add(slot)
+    matches = True
+    for slot, fields in FIELDS.items():
+      actual = tuple(raw_field(data, *field) for field in fields)
+      status, distance, lateral = expected.get(slot, (0, 0, 0))
+      # sendcan is stamped just after apply: allow one 10cm bin for motion,
+      # while still requiring exact statuses, lateral and empty-slot fields.
+      matches &= actual[0] == status and actual[2] == lateral and abs(actual[1] - distance) <= (1 if slot in moving else 0)
+    if matches:
       return True
   return False
 
@@ -168,19 +209,25 @@ def run(phases):
       req = request(phase, now)
       try:
         atomic_write(REQUEST_PATH, req)
-        print(f"{index + 1}/{len(phases)} {phase['slot']} status={phase['status']} ({phase['seconds']:g}s)", flush=True)
+        label = phase.get('label', '') or f"{phase['slot']} status={phase['status']}"
+        print(f"{index + 1}/{len(phases)} {label} ({phase['seconds']:g}s)", flush=True)
         acknowledged = False
+        last_ack = req['issued_ns']
+        moving = any(m['distance'] != m['end_distance'] for m in req.get('markers', []))
         while True:
           now = checked_update(sm)
           if now >= req['expires_ns']:
             break
           if (sm.updated['sendcan'] and sm.valid['sendcan'] and req['issued_ns'] <= sm.logMonoTime['sendcan'] <= now and
-              now - sm.logMonoTime['sendcan'] <= FRESH_NS and marker_observed(sm['sendcan'], req)):
+              now - sm.logMonoTime['sendcan'] <= FRESH_NS and marker_observed(sm['sendcan'], req, sm.logMonoTime['sendcan'])):
             if not acknowledged:
               print('HUD packet observed; this does not confirm cluster pixels.', flush=True)
             acknowledged = True
+            last_ack = now
           if not acknowledged and now - req['issued_ns'] >= 2_000_000_000:
             raise RuntimeError('No matching HUD packet within 2 seconds; marker request aborted')
+          if moving and acknowledged and now - last_ack > 500_000_000:
+            raise RuntimeError('Moving HUD packets stopped matching; marker request aborted')
         if not acknowledged:
           raise RuntimeError('Marker expired without a matching HUD packet')
       finally:
